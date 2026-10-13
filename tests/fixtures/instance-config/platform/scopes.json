@@ -1,0 +1,12 @@
+{
+  "scopes": {
+    "sn_example": {
+      "sys_id": "44444444444444444444444444444444",
+      "name": "Example",
+      "scope": "sn_example",
+      "version": "1.0.0",
+      "vendor": "",
+      "active": true
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "tables": {
+    "task": {
+      "sys_id": "11111111111111111111111111111111",
+      "label": "Task",
+      "super_class": "",
+      "scope": "global"
+    },
+    "incident": {
+      "sys_id": "22222222222222222222222222222222",
+      "label": "Incident",
+      "super_class": "11111111111111111111111111111111",
+      "scope": "global"
+    }
+  }
+}

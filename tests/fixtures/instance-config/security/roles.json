@@ -1,0 +1,11 @@
+{
+  "roles": {
+    "itil": {
+      "sys_id": "55555555555555555555555555555555",
+      "name": "itil",
+      "description": "Fulfiller",
+      "elevated_privilege": false,
+      "scope": "Global"
+    }
+  }
+}

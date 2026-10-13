@@ -1,0 +1,13 @@
+{
+  "items": {
+    "66666666666666666666666666666666": {
+      "name": "Example Laptop",
+      "short_description": "A laptop",
+      "active": true,
+      "category": "",
+      "price": "0",
+      "recurring_price": "0",
+      "flow_designer_flow": ""
+    }
+  }
+}

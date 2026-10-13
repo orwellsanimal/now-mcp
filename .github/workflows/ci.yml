@@ -1,0 +1,41 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        # "library" installs no extras: it proves the verbs work where the MCP SDK
+        # (compiled pydantic-core) can't be installed. "server" adds the extra and
+        # checks every verb is registered as an MCP tool.
+        name: ${{ matrix.os }} / py${{ matrix.python }} / ${{ matrix.mode }}
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+                python: ['3.10', '3.13']
+                mode: [library, server]
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+              with:
+                  python-version: ${{ matrix.python }}
+            - name: Install
+              shell: bash
+              run: |
+                  extra=""
+                  if [ "${{ matrix.mode }}" = server ]; then extra="[server]"; fi
+                  python -m pip install --upgrade pip
+                  python -m pip install -e "./now-config$extra" -e "./now-data$extra" pytest
+            - name: Test
+              run: python -m pytest -q
+            - name: Server test must not be skipped in server mode
+              if: matrix.mode == 'server'
+              shell: bash
+              run: python -m pytest -q tests/test_server.py -rs | tee out.txt && ! grep -q SKIPPED out.txt

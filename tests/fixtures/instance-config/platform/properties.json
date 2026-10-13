@@ -1,0 +1,11 @@
+{
+  "properties": {
+    "glide.example.flag": {
+      "sys_id": "33333333333333333333333333333333",
+      "value": "true",
+      "description": "An example flag",
+      "type": "true | false",
+      "scope": "Global"
+    }
+  }
+}

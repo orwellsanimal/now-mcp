@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "now-mcp-config"
+version = "0.2.0"
+description = "Read-only ServiceNow verbs over an instance-config snapshot, as a library and an MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "now-mcp contributors" }]
+keywords = ["mcp", "servicenow", "instance-config"]
+# The verbs are stdlib-only. `mcp` (which pulls in compiled pydantic-core) is
+# needed only for the stdio server, so it's an extra.
+dependencies = []
+
+[project.optional-dependencies]
+# Capped below 2.0: the SDK moved `mcp.server.fastmcp` in 2.0.
+server = ["mcp>=1.0,<2"]
+
+[project.scripts]
+now-mcp-config = "now_config.server:main"
+
+[project.urls]
+Repository = "https://github.com/orwellsanimal/now-mcp"
+Issues = "https://github.com/orwellsanimal/now-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["now_config"]

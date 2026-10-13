@@ -1,0 +1,26 @@
+{
+  "choices": {
+    "task.state": [
+      {
+        "value": "1",
+        "label": "Open",
+        "sequence": 1,
+        "inactive": false
+      },
+      {
+        "value": "7",
+        "label": "Retired",
+        "sequence": 7,
+        "inactive": true
+      }
+    ],
+    "task.priority": [
+      {
+        "value": "1",
+        "label": "1 - Critical",
+        "sequence": 1,
+        "inactive": false
+      }
+    ]
+  }
+}

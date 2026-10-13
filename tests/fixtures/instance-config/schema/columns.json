@@ -1,0 +1,68 @@
+{
+  "columns": {
+    "task": [
+      {
+        "element": "number",
+        "column_label": "Number",
+        "internal_type": "string",
+        "max_length": 40,
+        "mandatory": false,
+        "read_only": false,
+        "active": true,
+        "default_value": "",
+        "reference": "",
+        "scope": "global"
+      },
+      {
+        "element": "state",
+        "column_label": "State",
+        "internal_type": "integer",
+        "max_length": 40,
+        "mandatory": false,
+        "read_only": false,
+        "active": true,
+        "default_value": "",
+        "reference": "",
+        "scope": "global"
+      },
+      {
+        "element": "cmdb_ci",
+        "column_label": "Configuration item",
+        "internal_type": "reference",
+        "max_length": 40,
+        "mandatory": false,
+        "read_only": false,
+        "active": true,
+        "default_value": "",
+        "reference": "cmdb_ci",
+        "scope": "global"
+      }
+    ],
+    "incident": [
+      {
+        "element": "caller_id",
+        "column_label": "Caller",
+        "internal_type": "reference",
+        "max_length": 40,
+        "mandatory": true,
+        "read_only": false,
+        "active": true,
+        "default_value": "",
+        "reference": "sys_user",
+        "scope": "global"
+      },
+      {
+        "element": "state",
+        "column_label": "State",
+        "internal_type": "integer",
+        "max_length": 40,
+        "mandatory": false,
+        "read_only": false,
+        "active": true,
+        "default_value": "",
+        "reference": "",
+        "scope": "global"
+      }
+    ]
+  }
+}

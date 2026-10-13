@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "now-mcp-data"
+version = "0.2.0"
+description = "Live-instance ServiceNow verbs over PySNC (query, get, aggregate, gated writes), as a library and an MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "now-mcp contributors" }]
+keywords = ["mcp", "servicenow", "pysnc"]
+# Pure Python. `now_aggregate` additionally needs a PySNC with GlideAggregate
+# (ServiceNow/PySNC#146, not in a release yet); without it, that one verb
+# raises a clear NotImplementedError and the rest work.
+dependencies = [
+    "python-dotenv>=1.0",
+    "pysnc>=1.2.1",
+]
+
+[project.optional-dependencies]
+# Capped below 2.0: the SDK moved `mcp.server.fastmcp` in 2.0.
+server = ["mcp>=1.0,<2"]
+
+[project.scripts]
+now-mcp-data = "now_data.server:main"
+
+[project.urls]
+Repository = "https://github.com/orwellsanimal/now-mcp"
+Issues = "https://github.com/orwellsanimal/now-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["now_data"]
