@@ -31,7 +31,19 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 
 **Counting.** `now_query`'s `count` is the number of records *returned*, capped by `limit`. Use `now_aggregate` for a total.
 
-**Caveat:** like the Table API, the Stats API silently drops query terms it can't apply (an unknown field, or a choice label used as a value, e.g. `state=new`) and counts as if they weren't there. Checking queries first is now-mcp#4. Until then, use stored values (`state=1`) and check field names.
+**Requests are checked before they run.** ServiceNow silently drops an encoded-query term it can't apply and answers as if the term weren't there: `nonsense_field=xyz` matches every row, and `state=new` matches none because `state` stores `1`. So `now_query`, `now_get`, `now_aggregate` and `now_update` check each request against the table's fields and choice lists, read once per table from the UI Meta API (`/api/now/ui/meta/<table>`). They raise `now_data.query_check.QueryRefused`, a `ValueError` whose message carries the fix, for:
+
+- an unknown table, field or dot-walk step (in the query, `fields`, `group_by` or `*_fields`);
+- spaces or quotes around an operator;
+- a choice field given a label or an unknown value (`state stores '1' for 'new': use state=1`), including in `now_update` values, where ServiceNow would discard it and still report success;
+- an operator ServiceNow doesn't apply (`state~1`, a bare field);
+- text operators on a number-stored choice;
+- a repeated operator (`active==true`);
+- related-list conditions (`RLQUERY`), which aren't checked.
+
+If the fields can't be read, the verb raises `FieldsUnreadable` (a `RuntimeError`) and runs nothing, so it fails closed. The user needs read access to the UI Meta API.
+
+The rules and their measurements come from whitcortex (#2626, ADR-0134). What's accepted as applied (case-insensitive string choices, `state=01`) reflects that developer instance's collation, not a ServiceNow guarantee. Known limits: a misspelling that starts with a real operator (`stateLIKES`) passes; a retired choice (missing from UI Meta) is refused; catalog `variables.*` are refused.
 
 ## Credentials
 

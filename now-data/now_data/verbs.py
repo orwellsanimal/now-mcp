@@ -17,6 +17,7 @@ from typing import Any
 from now_data.aggregate import sn_aggregate
 from now_data.client import get_client
 from now_data.names import check_table
+from now_data.query_check import check as check_request
 
 __all__ = ["now_query", "now_get", "now_aggregate", "now_update", "now_run_script"]
 
@@ -56,7 +57,9 @@ def now_query(
     effective_limit = max(1, min(limit, MAX_LIMIT))
     field_list = _split(fields)
 
-    gr = get_client().GlideRecord(check_table(table))
+    client = get_client()
+    check_request(client, check_table(table), query=query, fields={"fields": field_list})
+    gr = client.GlideRecord(table)
     if query:
         gr.add_encoded_query(query)
     if field_list:
@@ -88,7 +91,9 @@ def now_get(
     as a bad sys_id, not an empty result.
     """
     field_list = _split(fields)
-    gr = get_client().GlideRecord(check_table(table))
+    client = get_client()
+    check_request(client, check_table(table), fields={"fields": field_list})
+    gr = client.GlideRecord(table)
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "
@@ -120,6 +125,9 @@ def now_aggregate(
     reference/choice fields; set False for raw values/sys_ids.
     """
     client = get_client()
+    check_request(client, check_table(table), query=query, fields={
+        "group_by": _split(group_by), "sum_fields": _split(sum_fields), "avg_fields": _split(avg_fields),
+        "min_fields": _split(min_fields), "max_fields": _split(max_fields)})
     return sn_aggregate(
         client,
         table,
@@ -152,9 +160,15 @@ def now_update(
     a non-existent column, so this surfaces typos instead of a false success
     (see the polymorphic-m2m gotcha).
 
-    Raises ValueError if no record with that sys_id exists.
+    A choice field must be given a value it stores, not its label: ServiceNow
+    silently discards an out-of-list choice value and still reports success, so
+    `state="In Progress"` is refused with `use state=2`. Raises
+    `query_check.QueryRefused` (a ValueError) for that, and ValueError if no
+    record with that sys_id exists.
     """
-    gr = get_client().GlideRecord(check_table(table))
+    client = get_client()
+    check_request(client, check_table(table), values=values)
+    gr = client.GlideRecord(table)
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "

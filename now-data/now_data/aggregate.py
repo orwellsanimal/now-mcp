@@ -6,8 +6,8 @@ in ServiceNow/PySNC#146) calls too; the response is the same, so this needs
 neither the fork nor a PySNC release that ships it (now-mcp#5).
 
 The Stats API silently drops query terms it can't apply (an unknown field, a
-choice label used as a value) and counts as if they weren't there. Checking the
-query first is now-mcp#4.
+choice label used as a value) and counts as if they weren't there. verbs.py
+checks the request first (query_check.py, now-mcp#4).
 """
 
 from __future__ import annotations

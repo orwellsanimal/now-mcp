@@ -2,7 +2,26 @@
 
 import pytest
 
-from now_data import verbs
+from now_data import query_check, verbs
+
+# What the fake instance's UI Meta API answers (now-mcp#4 checks every request against it).
+STATE = [{"value": str(v), "label": l} for v, l in ((1, "New"), (2, "In Progress"), (6, "Resolved"), (7, "Closed"))]
+GENERIC = {
+    "sys_id": {"type": "GUID"}, "number": {"type": "string"}, "short_description": {"type": "string"},
+    "state": {"type": "choice", "internal_type": "integer", "choices": STATE},
+    "priority": {"type": "choice", "internal_type": "integer", "choices": [{"value": "1", "label": "1 - Critical"}]},
+    "active": {"type": "boolean", "internal_type": "boolean"},
+    "assigned_to": {"type": "reference", "reference": "sys_user"},
+    "assignment_group": {"type": "reference", "reference": "sys_user_group"},
+    "reassignment_count": {"type": "integer", "internal_type": "integer"},
+}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_column_cache():
+    query_check._COLUMNS.clear()
+    yield
+    query_check._COLUMNS.clear()
 
 
 class FakeGR:
@@ -54,6 +73,7 @@ class FakeClient:
     def __init__(self, db):
         self.db = db
         self.posts = []
+        self.session = FakeSession(None)
 
     def GlideRecord(self, table):
         return FakeGR(self.db, table)
@@ -104,12 +124,15 @@ class FakeResp:
 
 
 class FakeSession:
-    """Records Stats API GETs and answers with a canned response."""
+    """Answers UI Meta reads with GENERIC columns; records Stats API GETs and answers them with a canned response."""
 
     def __init__(self, resp):
-        self.resp, self.gets = resp, []
+        self.resp, self.gets, self.meta_reads = resp, [], []
 
     def get(self, url, params=None, headers=None, timeout=None):
+        if "/api/now/ui/meta/" in url:
+            self.meta_reads.append(url.rsplit("/", 1)[1])
+            return FakeResp(200, {"result": {"columns": GENERIC}})
         self.gets.append((url, dict(params or {})))
         self.timeout = timeout
         if isinstance(self.resp, Exception):
