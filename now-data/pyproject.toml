@@ -4,16 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "now-mcp-data"
-version = "0.2.1"
+version = "0.3.0"
 description = "Live-instance ServiceNow verbs over PySNC (query, get, aggregate, gated writes), as a library and an MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "now-mcp contributors" }]
 keywords = ["mcp", "servicenow", "pysnc"]
-# Pure Python. `now_aggregate` additionally needs a PySNC with GlideAggregate
-# (ServiceNow/PySNC#146, not in a release yet); without it, that one verb
-# raises a clear NotImplementedError and the rest work.
+# Pure Python. Every verb works on released PySNC: `now_aggregate` calls the
+# Stats API over PySNC's session and doesn't need GlideAggregate (now-mcp#5).
 dependencies = [
     "python-dotenv>=1.0",
     "pysnc>=1.2.1",
