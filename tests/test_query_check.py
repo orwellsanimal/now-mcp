@@ -461,3 +461,19 @@ def test_a_text_value_may_start_with_an_operator_character(counting, query):
 @pytest.mark.parametrize("query", ["priority==1", "active==true"])
 def test_a_repeated_operator_on_a_non_text_field_refuses(refusing, query):
     assert "repeats its operator" in _refusal(lambda: count(query))
+
+
+def test_now_update_refuses_blanking_a_choice_with_no_empty_entry(refusing):
+    # In a query '' means "is empty"; as a write it would blank state (now-mcp#8 review).
+    assert "state has no empty choice" in _refusal(
+        lambda: verbs.now_update("incident", "id1", {"state": ""}))
+
+
+def test_now_update_may_blank_a_choice_whose_list_has_an_empty_entry(counting):
+    # priority lists "" ("-- None --"), so clearing it is a real choice.
+    assert verbs.now_update("incident", "id1", {"priority": ""})["action"] == "preview"
+
+
+def test_an_empty_value_in_a_query_is_still_is_empty(counting):
+    count("state=")
+    assert counting.stats_params[-1]["sysparm_query"] == "state="

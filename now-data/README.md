@@ -41,7 +41,17 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 - a repeated operator (`active==true`);
 - related-list conditions (`RLQUERY`), which aren't checked.
 
-If the fields can't be read, the verb raises `FieldsUnreadable` (a `RuntimeError`) and runs nothing, so it fails closed. The user needs read access to the UI Meta API.
+If the fields can't be read, the verb raises `FieldsUnreadable` (a `RuntimeError`) and runs nothing, so it fails closed.
+
+**Access to the UI Meta API.** It's an internal UI endpoint and isn't in ServiceNow's REST API reference, so no documented role grants it. As of 0.4.0, every read verb depends on it. An identity that can read tables but gets 401/403 from UI Meta will see every verb refuse with `FieldsUnreadable`, naming the status. Check an identity before relying on it. Use the full instance URL here (`https://dev123.service-now.com`): curl doesn't expand a bare name the way now-data does, so `dev123` prints `000`.
+
+```bash
+INSTANCE=https://dev123.service-now.com
+curl -s -o /dev/null -w "%{http_code}\n" -u "$SN_USER:$SN_PASSWORD" \
+  -H "Accept: application/json" "$INSTANCE/api/now/ui/meta/incident"
+```
+
+`200` means the checks work for that user. Verified: an admin-level developer user and whitcortex's integration identity both get `200`. For a locked-down integration user, ask the instance admin which ACL or role opens `/api/now/ui/meta`, and record the answer here.
 
 The rules and their measurements come from whitcortex (#2626, ADR-0134). What's accepted as applied (case-insensitive string choices, `state=01`) reflects that developer instance's collation, not a ServiceNow guarantee. Known limits: a misspelling that starts with a real operator (`stateLIKES`) passes; a retired choice (missing from UI Meta) is refused; catalog `variables.*` are refused.
 
