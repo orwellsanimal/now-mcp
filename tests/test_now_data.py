@@ -282,3 +282,31 @@ def test_an_unreachable_instance_is_named_not_a_raw_connection_error(client, sta
     client.session = FakeSession(requests.ConnectionError("Name or service not known"))
     with pytest.raises(RuntimeError, match="could not reach the instance.*SN_INSTANCE"):
         verbs.now_aggregate("incident")
+
+
+class DownSession:
+    """An instance that's down: every URL raises, UI Meta included (the path a real outage takes)."""
+
+    def __init__(self, exc):
+        self.exc, self.urls = exc, []
+
+    def get(self, url, **kwargs):
+        self.urls.append(url)
+        raise self.exc
+
+
+@pytest.mark.parametrize("verb", ["now_aggregate", "now_query"])
+def test_an_unreachable_instance_is_named_when_the_field_check_fails_first(client, verb):
+    import requests
+    client.session = DownSession(requests.ConnectionError("Name or service not known"))
+    with pytest.raises(query_check.FieldsUnreadable, match="could not reach the instance.*SN_INSTANCE.*Nothing was run"):
+        getattr(verbs, verb)("incident", query="state=1")
+    assert client.session.urls and all("/api/now/ui/meta/" in u for u in client.session.urls)
+
+
+def test_a_ui_meta_timeout_is_not_called_unreachable(client):
+    import requests
+    client.session = DownSession(requests.ConnectTimeout("timed out"))  # both a Timeout and a ConnectionError
+    with pytest.raises(query_check.FieldsUnreadable, match="could not read the fields.*ConnectTimeout") as caught:
+        verbs.now_aggregate("incident", query="state=1")
+    assert "could not reach" not in str(caught.value)
