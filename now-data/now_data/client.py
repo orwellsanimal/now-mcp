@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import os
+import socket
+import ssl
 import time
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
@@ -31,7 +33,8 @@ _explicit: tuple[str, str, str] | None = None
 
 
 class ConfigError(RuntimeError):
-    """Raised when SN_* credentials are missing — distinct from instance errors."""
+    """Raised when the SN_* settings are missing or wrong (a 401, a host that doesn't resolve, an
+    untrusted certificate): waiting won't fix them. Distinct from a slow or sleeping instance."""
 
 
 def instance_url(instance: str) -> str:
@@ -90,6 +93,11 @@ def _creds() -> tuple[str, str, str]:
 def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 120) -> None:
     """Block until the instance returns JSON to an authenticated API call.
 
+    Waiting only helps a sleeping instance, so answers that waiting can't fix fail at once with
+    ConfigError: a 401 (now-mcp#2), a name that doesn't resolve (#10), a certificate that doesn't
+    verify. A JSON 403 means the instance is awake (the user just can't read sys_user), so it
+    returns. Anything else (5xx, the HTML wake page, a timeout, a refused connection) is retried.
+
     Raises RuntimeError if the instance does not wake within `timeout_s`.
     """
     creds = base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -111,13 +119,35 @@ def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 1
             with urlopen(req, timeout=15) as resp:
                 if "application/json" in resp.headers.get("Content-Type", ""):
                     return
-        except (URLError, HTTPError, TimeoutError):
+        except HTTPError as e:  # before URLError: HTTPError is one
+            if e.code == 401:
+                raise ConfigError(
+                    f"{instance_url} refused user {user!r} (HTTP 401): the password is wrong, or the "
+                    "user can't use Basic auth over REST (when "
+                    "glide.authenticate.basic_auth.restriction.enforce is true, it needs the "
+                    "snc_basic_auth_api_access role)."
+                ) from None
+            if e.code == 403 and "application/json" in (e.headers.get("Content-Type") or ""):
+                return
+        except URLError as e:
+            if isinstance(e.reason, socket.gaierror):
+                raise ConfigError(
+                    f"could not reach the instance: {urlsplit(instance_url).hostname!r} does not resolve "
+                    f"({e.reason}); check SN_INSTANCE."
+                ) from None
+            if isinstance(e.reason, ssl.SSLCertVerificationError):
+                raise ConfigError(
+                    f"the TLS connection to {instance_url} failed ({e.reason}); if a proxy inspects "
+                    "TLS, its CA must be trusted: in the Windows certificate store, or in a file "
+                    "named by SSL_CERT_FILE."
+                ) from None
+        except TimeoutError:
             pass
         time.sleep(3)
 
     raise RuntimeError(
         f"Instance at {instance_url} did not respond with JSON within {timeout_s}s. "
-        "It may be hibernating beyond expected wake time, or credentials may be invalid."
+        "It may be hibernating beyond expected wake time."
     )
 
 

@@ -68,7 +68,13 @@ client.configure("dev123", user, password)   # bare name, host, or https URL
 
 `SN_INSTANCE` and `configure()` both accept a bare instance name (`dev123`), a host, or a full URL.
 
-The first call waits for a hibernating developer instance to wake up and return JSON. It uses Basic auth, so some instances return 401 over REST even with correct credentials. That happens when `glide.authenticate.basic_auth.restriction.enforce=true`, unless the user has the `snc_basic_auth_api_access` role.
+The first call waits (up to 120 s) for a hibernating developer instance to wake up and return JSON. Answers that waiting can't fix raise `ConfigError` at once instead:
+
+- **HTTP 401.** The password is wrong, or the user can't use Basic auth over REST. Some instances return 401 even with correct credentials: that happens when `glide.authenticate.basic_auth.restriction.enforce=true`, unless the user has the `snc_basic_auth_api_access` role.
+- **A host that doesn't resolve.** Check `SN_INSTANCE`.
+- **A certificate that doesn't verify**, e.g. behind a TLS-inspecting proxy. This first call uses Python's `urllib`, which trusts the Windows certificate store and `SSL_CERT_FILE`. The verbs use `requests`, which trusts certifi and `REQUESTS_CA_BUNDLE` instead, so a proxy CA may need to be in both.
+
+A JSON 403 counts as awake: the instance answered, and the verbs report their own permissions.
 
 ## `now_run_script` endpoint
 
