@@ -37,6 +37,15 @@ pip install "pysnc @ git+https://github.com/orwellsanimal/PySNC.git@feat/glide-a
 
 The verbs read `SN_INSTANCE`, `SN_USER` and `SN_PASSWORD` from the environment, or from the nearest `.env` found by walking up from the CWD. Values already in the environment win. Missing values raise `now_data.client.ConfigError`.
 
+A caller with its own credential handling can pass them explicitly instead. These take precedence over the environment:
+
+```python
+from now_data import client
+client.configure("dev123", user, password)   # bare name, host, or https URL
+```
+
+`SN_INSTANCE` and `configure()` both accept a bare instance name (`dev123`), a host, or a full URL.
+
 The first call waits for a hibernating developer instance to wake up and return JSON. It uses Basic auth, so some instances return 401 over REST even with correct credentials. That happens when `glide.authenticate.basic_auth.restriction.enforce=true`, unless the user has the `snc_basic_auth_api_access` role.
 
 ## `now_run_script` endpoint

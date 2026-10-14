@@ -13,6 +13,7 @@ import os
 import time
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from dotenv import find_dotenv, load_dotenv
@@ -25,26 +26,65 @@ if TYPE_CHECKING:
 # needed once a verb actually talks to the instance.
 _client: "ServiceNowClient | None" = None
 _awake = False
+# Set by configure(): explicit credentials win over SN_* env / .env.
+_explicit: tuple[str, str, str] | None = None
 
 
 class ConfigError(RuntimeError):
     """Raised when SN_* credentials are missing — distinct from instance errors."""
 
 
+def instance_url(instance: str) -> str:
+    """`dev123`, `dev123.service-now.com` or a full URL -> `https://dev123.service-now.com`.
+
+    Keeps only scheme, host and port, so a URL pasted from the browser's address bar
+    (`https://dev123.service-now.com/now/nav/ui/...`) still points the wake
+    check and PySNC at the instance root.
+    """
+    raw = instance.strip()
+    bare = "://" not in raw
+    try:
+        parts = urlsplit(f"https://{raw}" if bare else raw)
+        host, port = parts.hostname, parts.port  # hostname drops any user:pw@
+    except ValueError as e:
+        raise ConfigError(f"Can't read an instance URL from {instance!r}: {e}") from None
+    if not host:
+        raise ConfigError(f"Can't read an instance host from {instance!r}.")
+    if bare and "." not in host:
+        host = f"{host}.service-now.com"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port else "")
+
+
+def configure(instance: str, user: str, password: str) -> None:
+    """Use these credentials instead of SN_INSTANCE / SN_USER / SN_PASSWORD.
+
+    For library callers that resolve credentials their own way. Drops any
+    cached client, so the next verb connects (and wakes the instance) afresh.
+    """
+    global _explicit, _client, _awake
+    if not all(v and v.strip() for v in (instance, user, password)):
+        raise ConfigError("configure() needs a non-empty instance, user and password.")
+    _explicit = (instance_url(instance), user, password)
+    _client = None
+    _awake = False
+
+
 def _creds() -> tuple[str, str, str]:
-    """Return (instance, user, password) from the environment / nearest .env."""
+    """Return (instance URL, user, password): from configure(), else the env / nearest .env."""
+    if _explicit is not None:
+        return _explicit
     # find_dotenv walks up from cwd; explicit env vars still win if already set.
     load_dotenv(find_dotenv(usecwd=True))
     instance = os.getenv("SN_INSTANCE")
     user = os.getenv("SN_USER")
     password = os.getenv("SN_PASSWORD")
-    if not (instance and user and password):
+    if not all(v and v.strip() for v in (instance, user, password)):
         raise ConfigError(
             "SN_INSTANCE, SN_USER, and SN_PASSWORD must be set (in the "
             "environment or a .env file). now-data talks to a live instance "
             "and cannot run without credentials."
         )
-    return instance, user, password
+    return instance_url(instance), user, password
 
 
 def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 120) -> None:
