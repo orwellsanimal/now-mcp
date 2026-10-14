@@ -94,9 +94,74 @@ def test_update_previews_by_default_and_writes_only_when_confirmed(client):
     assert "bogus" not in client.db["incident"]["id1"]
 
 
-def test_aggregate_without_glideaggregate_raises_clearly(client):
-    with pytest.raises(NotImplementedError, match="GlideAggregate"):
-        verbs.now_aggregate("incident", group_by="state")
+class FakeResp:
+    def __init__(self, status, body, reason="Bad Request"):
+        self.status_code, self._body, self.reason = status, body, reason
+
+    def json(self):
+        return self._body
+
+
+class FakeSession:
+    """Records Stats API GETs and answers with a canned response."""
+
+    def __init__(self, resp):
+        self.resp, self.gets = resp, []
+
+    def get(self, url, params=None, headers=None):
+        self.gets.append((url, dict(params or {})))
+        return self.resp
+
+
+@pytest.fixture
+def stats(client, monkeypatch):
+    def answer(status, body):
+        client.session = FakeSession(FakeResp(status, body))
+        return client.session
+    return answer
+
+
+def test_aggregate_needs_no_glideaggregate(client, stats):
+    # FakeClient, like released PySNC (1.2.1), has no GlideAggregate attribute (now-mcp#5).
+    assert not hasattr(client, "GlideAggregate")
+    s = stats(200, {"result": {"stats": {"count": "59"}}})
+    assert verbs.now_aggregate("incident", query="state=1") == {"count": 59}
+    assert s.gets == [("https://example.service-now.com/api/now/stats/incident",
+                       {"sysparm_count": "true", "sysparm_query": "state=1"})]
+
+
+def test_aggregate_grouped_with_labels_and_field_stats(client, stats):
+    s = stats(200, {"result": [
+        {"stats": {"count": "3", "avg": {"reassignment_count": "1.5"}},
+         "groupby_fields": [{"field": "state", "value": "1", "display_value": "New"}]},
+        {"stats": {"count": "2", "avg": {"reassignment_count": "0"}},
+         "groupby_fields": [{"field": "state", "value": "", "display_value": ""}]},
+    ]})
+    out = verbs.now_aggregate("incident", group_by="state", avg_fields="reassignment_count")
+    assert out == {"New": {"count": 3, "avg": {"reassignment_count": "1.5"}},
+                   "(empty)": {"count": 2, "avg": {"reassignment_count": "0"}}}
+    assert s.gets[0][1] == {"sysparm_count": "true", "sysparm_avg_fields": "reassignment_count",
+                            "sysparm_group_by": "state", "sysparm_display_value": "all"}
+
+
+def test_aggregate_grouped_raw_values(client, stats):
+    stats(200, {"result": [{"stats": {"count": "3"},
+                            "groupby_fields": [{"field": "state", "value": "1", "display_value": "New"}]}]})
+    assert verbs.now_aggregate("incident", group_by="state", display_value=False) == {"1": {"count": 3}}
+
+
+def test_aggregate_needs_at_least_one_statistic(client, stats):
+    s = stats(200, {"result": {}})
+    with pytest.raises(ValueError, match="At least one aggregate"):
+        verbs.now_aggregate("incident", count=False)
+    assert s.gets == []
+
+
+@pytest.mark.parametrize("status, exc", [(400, ValueError), (404, ValueError), (401, RuntimeError), (403, RuntimeError)])
+def test_aggregate_http_errors_name_the_status(client, stats, status, exc):
+    stats(status, {"error": {"message": "Invalid table incidents"}})
+    with pytest.raises(exc, match=f"HTTP {status}.*Invalid table incidents"):
+        verbs.now_aggregate("incidents")
 
 
 def test_run_script_preview_never_touches_the_instance(monkeypatch):

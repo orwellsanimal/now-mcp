@@ -47,7 +47,10 @@ def now_query(
     `display_value=True` returns human-readable labels for reference/choice
     fields instead of raw values/sys_ids.
 
-    Returns `{count, truncated, records: [...]}`.
+    Returns `{count, truncated, records: [...]}`. `count` is the number of
+    records **returned** (at most `limit`), not the table total: when
+    `truncated` is true there are more matches and the total is unknown. Use
+    `now_aggregate` to count.
     """
     effective_limit = max(1, min(limit, MAX_LIMIT))
     field_list = _split(fields)
@@ -104,7 +107,7 @@ def now_aggregate(
     max_fields: str = "",
     display_value: bool = True,
 ) -> dict[str, Any]:
-    """Compute COUNT/SUM/AVG/MIN/MAX on a table via the Stats API.
+    """Compute COUNT/SUM/AVG/MIN/MAX on a table via the Stats API (works on released PySNC).
 
     `query` filters (encoded query). `group_by` is a comma-separated field list;
     omit it for a single overall aggregate. `*_fields` are comma-separated
@@ -116,13 +119,6 @@ def now_aggregate(
     reference/choice fields; set False for raw values/sys_ids.
     """
     client = get_client()
-    if not hasattr(client, "GlideAggregate"):
-        raise NotImplementedError(
-            "now_aggregate needs a PySNC with GlideAggregate (ServiceNow/PySNC#146). "
-            "The installed PySNC release doesn't have it; install the fork "
-            "(git+https://github.com/orwellsanimal/PySNC.git@feat/glide-aggregate) "
-            "or a PySNC release that includes it."
-        )
     return sn_aggregate(
         client,
         table,

@@ -14,7 +14,7 @@ Usable two ways:
 |---|---|
 | `now_query(table, query="", fields="", limit=50, display_value=False)` | Returns `{count, truncated, records}`. `limit` is capped at 1000 and `truncated` is set without a second count call |
 | `now_get(table, sys_id, fields="", display_value=False)` | Raises `ValueError` on a missing sys_id |
-| `now_aggregate(table, query="", group_by="", count=True, sum_fields="", …)` | COUNT/SUM/AVG/MIN/MAX via the Stats API. Needs PySNC with `GlideAggregate` (see below) |
+| `now_aggregate(table, query="", group_by="", count=True, sum_fields="", …)` | COUNT/SUM/AVG/MIN/MAX via the Stats API (see below) |
 | `now_update(table, sys_id, values, confirmed=False)` | **Dry run by default**: returns `changes` / `no_ops` / `unknown_fields` and writes nothing. Writes only with `confirmed=True`. Unknown fields are never written, because ServiceNow silently ignores writes to non-existent columns |
 | `now_run_script(script, confirmed=False)` | **Gated** server-side JavaScript. The default echoes the script back. `confirmed=True` needs the instance-side endpoint described below |
 
@@ -27,11 +27,11 @@ pip install "now-mcp-data @ git+https://github.com/orwellsanimal/now-mcp#subdire
 pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp#subdirectory=now-data"
 ```
 
-**`now_aggregate` and PySNC.** It uses `GlideAggregate`, which is proposed upstream in ServiceNow/PySNC#146 and isn't in a PySNC release yet. On a released PySNC that one verb raises `NotImplementedError`, and every other verb works. To enable it, install the fork, which is also pure Python:
+**`now_aggregate` and PySNC.** It calls `GET /api/now/stats/{table}` over PySNC's authenticated session, so it works on released PySNC. It doesn't need `GlideAggregate` (ServiceNow/PySNC#146), which calls the same endpoint.
 
-```bash
-pip install "pysnc @ git+https://github.com/orwellsanimal/PySNC.git@feat/glide-aggregate"
-```
+**Counting.** `now_query`'s `count` is the number of records *returned*, capped by `limit`. Use `now_aggregate` for a total.
+
+**Caveat:** like the Table API, the Stats API silently drops query terms it can't apply (an unknown field, or a choice label used as a value, e.g. `state=new`) and counts as if they weren't there. Checking queries first is now-mcp#4. Until then, use stored values (`state=1`) and check field names.
 
 ## Credentials
 
