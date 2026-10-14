@@ -36,6 +36,11 @@ def fresh(monkeypatch):
         ("dev123.service-now.com", "https://dev123.service-now.com"),
         ("https://dev123.service-now.com/", "https://dev123.service-now.com"),
         (" acme.example.com ", "https://acme.example.com"),
+        ("https://dev123.service-now.com/now/nav/ui/classic", "https://dev123.service-now.com"),
+        ("HTTPS://dev123.service-now.com", "https://dev123.service-now.com"),
+        ("dev123/now/nav/ui", "https://dev123.service-now.com"),
+        ("http://localhost:8080/x", "http://localhost:8080"),
+        ("https://admin:pw@dev123.service-now.com/", "https://dev123.service-now.com"),
     ],
 )
 def test_instance_url(given, url):
@@ -64,9 +69,29 @@ def test_configure_wins_over_env_and_resets_the_cached_client(fresh, monkeypatch
     assert woke == ["https://envinst.service-now.com", "https://other.service-now.com"]
 
 
-def test_configure_rejects_blanks(fresh):
+@pytest.mark.parametrize(
+    "instance, user, password",
+    [("dev1", "", "pw"), ("   ", "u", "pw"), ("dev1", " ", "pw"), ("dev1", "u", "	")],
+)
+def test_configure_rejects_blanks(fresh, instance, user, password):
     with pytest.raises(client.ConfigError):
-        client.configure("dev1", "", "pw")
+        client.configure(instance, user, password)
+
+
+def test_whitespace_env_instance_raises_config_error(fresh, monkeypatch):
+    made, woke = fresh
+    monkeypatch.setenv("SN_INSTANCE", "   ")
+    monkeypatch.setenv("SN_USER", "u")
+    monkeypatch.setenv("SN_PASSWORD", "p")
+    with pytest.raises(client.ConfigError):
+        client.get_client()
+    assert woke == []
+
+
+@pytest.mark.parametrize("given", ["", "https://", "   ", "dev123:notaport"])
+def test_instance_url_without_a_host_raises_config_error(given):
+    with pytest.raises(client.ConfigError):
+        client.instance_url(given)
 
 
 def test_missing_credentials_raise_config_error(fresh):
