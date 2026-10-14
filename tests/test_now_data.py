@@ -95,8 +95,9 @@ def test_update_previews_by_default_and_writes_only_when_confirmed(client):
 
 
 class FakeResp:
-    def __init__(self, status, body, reason="Bad Request"):
+    def __init__(self, status, body, reason="Bad Request", content_type="application/json;charset=UTF-8"):
         self.status_code, self._body, self.reason = status, body, reason
+        self.headers = {"Content-Type": content_type} if content_type else {}
 
     def json(self):
         return self._body
@@ -108,8 +109,11 @@ class FakeSession:
     def __init__(self, resp):
         self.resp, self.gets = resp, []
 
-    def get(self, url, params=None, headers=None):
+    def get(self, url, params=None, headers=None, timeout=None):
         self.gets.append((url, dict(params or {})))
+        self.timeout = timeout
+        if isinstance(self.resp, Exception):
+            raise self.resp
         return self.resp
 
 
@@ -177,3 +181,73 @@ def test_run_script_endpoint_missing_executes_nothing(client):
     r = verbs.now_run_script("return 1;", confirmed=True)
     assert r["action"] == "endpoint_missing"
     assert "servicenow-coder" not in r["note"]
+
+
+def _grp(field, value, label, count):
+    return {"stats": {"count": str(count)},
+            "groupby_fields": [{"field": field, "value": value, "display_value": label}]}
+
+
+def test_grouped_labels_that_collide_keep_every_count(client, stats):
+    # Two people with one name, plus a reference with no label (live on dev442835: an
+    # assignment_group whose record shows a blank name collided with "no group" and lost a count).
+    stats(200, {"result": [
+        _grp("assigned_to", "a1b2", "John Smith", 7),
+        _grp("assigned_to", "c3d4", "John Smith", 3),
+        _grp("assigned_to", "e5f6", "", 1),
+        _grp("assigned_to", "", "", 5),
+        _grp("assigned_to", "g7h8", "Ann Lee", 2),
+    ]})
+    out = verbs.now_aggregate("incident", group_by="assigned_to")
+    assert out == {"John Smith [a1b2]": {"count": 7}, "John Smith [c3d4]": {"count": 3},
+                   "(no label) [e5f6]": {"count": 1}, "(empty)": {"count": 5}, "Ann Lee": {"count": 2}}
+    assert sum(v["count"] for v in out.values()) == 18
+
+
+def test_grouped_by_two_fields_qualifies_only_the_colliding_rows(client, stats):
+    def row(a, b, n):
+        return {"stats": {"count": str(n)}, "groupby_fields": [
+            {"field": "assigned_to", "value": a[0], "display_value": a[1]},
+            {"field": "priority", "value": b[0], "display_value": b[1]}]}
+    stats(200, {"result": [row(("a1", "Jo"), ("1", "1 - Critical"), 4),
+                           row(("b2", "Jo"), ("1", "1 - Critical"), 6),
+                           row(("a1", "Jo"), ("2", "2 - High"), 1)]})
+    out = verbs.now_aggregate("incident", group_by="assigned_to,priority")
+    assert out == {"Jo [a1], 1 - Critical [1]": {"count": 4}, "Jo [b2], 1 - Critical [1]": {"count": 6},
+                   "Jo, 2 - High": {"count": 1}}
+
+
+@pytest.mark.parametrize("table", ["../table/sys_user", "incident?sysparm_query=x&", "Incident", "", "inc ident", "incident/x"])
+def test_a_table_that_is_not_a_plain_name_is_refused_before_any_request(client, stats, table):
+    s = stats(200, {"result": {"stats": {"count": "1"}}})
+    with pytest.raises(ValueError, match="is not a table name"):
+        verbs.now_aggregate(table)
+    with pytest.raises(ValueError, match="is not a table name"):
+        verbs.now_query(table)
+    with pytest.raises(ValueError, match="is not a table name"):
+        verbs.now_get(table, "id1")
+    with pytest.raises(ValueError, match="is not a table name"):
+        verbs.now_update(table, "id1", {"state": "2"})
+    assert s.gets == []
+
+
+@pytest.mark.parametrize("table", ["incident", "u_custom_2", "x_1111454_fsmchgbr_link", "cmdb_ci_ip_router"])
+def test_plain_table_names_pass(client, stats, table):
+    stats(200, {"result": {"stats": {"count": "1"}}})
+    assert verbs.now_aggregate(table) == {"count": 1}
+
+
+def test_the_stats_call_has_a_timeout_and_names_it(client, stats):
+    import requests
+    s = stats(200, {"result": {"stats": {"count": "1"}}})
+    verbs.now_aggregate("incident")
+    assert s.timeout == (10, 60)
+    client.session = FakeSession(requests.ReadTimeout("read timed out"))
+    with pytest.raises(RuntimeError, match="did not answer within 60s"):
+        verbs.now_aggregate("incident")
+
+
+def test_a_200_that_is_not_json_says_the_instance_may_be_hibernating(client):
+    client.session = FakeSession(FakeResp(200, None, content_type="text/html;charset=UTF-8"))
+    with pytest.raises(RuntimeError, match="text/html.*not JSON.*hibernating"):
+        verbs.now_aggregate("incident")

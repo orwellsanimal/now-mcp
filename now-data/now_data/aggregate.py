@@ -14,12 +14,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Union
 
+from now_data.names import check_table
+
 if TYPE_CHECKING:
     # Type-only: pysnc is never imported at module load so the server can list
     # tools without it.
     from pysnc import ServiceNowClient
 
 _FIELD_AGGS = ("avg", "sum", "min", "max")
+# (connect, read) seconds. PySNC's session sets no timeout, so a stalled
+# connection would otherwise hold the verb (and an agent's turn) forever.
+TIMEOUT = (10, 60)
 
 
 def _split_fields(csv: str) -> list[str]:
@@ -58,8 +63,17 @@ def _error_detail(resp: Any) -> str:
 
 
 def _get_stats(client: "ServiceNowClient", table: str, params: dict[str, str]) -> Any:
-    url = f"{client.instance.rstrip('/')}/api/now/stats/{table}"
-    resp = client.session.get(url, params=params, headers={"Accept": "application/json"})
+    import requests  # PySNC's own dependency; imported here so module load stays light
+
+    url = f"{client.instance.rstrip('/')}/api/now/stats/{check_table(table)}"
+    try:
+        resp = client.session.get(url, params=params, headers={"Accept": "application/json"},
+                                  timeout=TIMEOUT)
+    except requests.Timeout as e:
+        raise RuntimeError(
+            f"Stats API for {table} did not answer within {TIMEOUT[1]}s ({type(e).__name__}); "
+            "the instance may be slow or hibernating."
+        ) from None
     if resp.status_code in (401, 403):
         raise RuntimeError(
             f"Stats API refused the request (HTTP {resp.status_code}) for {table}: "
@@ -70,6 +84,12 @@ def _get_stats(client: "ServiceNowClient", table: str, params: dict[str, str]) -
         raise ValueError(
             f"Stats API error (HTTP {resp.status_code}) for {table}: "
             f"{_error_detail(resp) or resp.reason}."
+        )
+    if "application/json" not in resp.headers.get("Content-Type", ""):
+        # A developer instance that hibernated again answers 200 with its HTML wake page.
+        raise RuntimeError(
+            f"Stats API for {table} returned {resp.headers.get('Content-Type') or 'no content type'}, "
+            "not JSON; the instance may be hibernating. Wake it and try again."
         )
     result = resp.json().get("result", {})
     # Ungrouped: {stats: {...}}. Grouped: [{stats: {...}, groupby_fields: [...]}, ...].
@@ -95,14 +115,46 @@ def _parse_stats(stats: dict, count: bool, field_aggs: dict[str, list[str]]) -> 
     return parsed
 
 
-def _group_key(row: dict, group_fields: list[str], display_value: bool) -> str:
+def _group_parts(row: dict, group_fields: list[str]) -> list[tuple[str, str]]:
+    """(value, label) per group field. Empty value = no value; empty label = no display value."""
     by_field = {gf.get("field"): gf for gf in row.get("groupby_fields", [])}
-    parts = []
+    out = []
     for f in group_fields:
         gf = by_field.get(f, {})
-        v = gf.get("display_value", gf.get("value")) if display_value else gf.get("value")
-        parts.append(v or "(empty)")
-    return ", ".join(parts)
+        value = str(gf.get("value") or "")
+        out.append((value, str(gf.get("display_value") if "display_value" in gf else value) or ""))
+    return out
+
+
+def _group_keys(rows: list[dict], group_fields: list[str], display_value: bool) -> list[str]:
+    """One distinct key per row.
+
+    Raw values are distinct by construction. Labels are not: two records can
+    share a name, and a reference whose record is gone (or has a blank name)
+    has a value but an empty label. Keying on the label alone would let one
+    group overwrite another and lose its count, so a label is qualified with
+    its value wherever it would be ambiguous.
+    """
+    parts = [_group_parts(row, group_fields) for row in rows]
+    if not display_value:
+        return [", ".join(v or "(empty)" for v, _ in p) for p in parts]
+
+    def part(value: str, label: str, qualify: bool) -> str:
+        if not value:
+            return "(empty)"
+        if not label:
+            return f"(no label) [{value}]"
+        return f"{label} [{value}]" if qualify else label
+
+    plain = [", ".join(part(v, lab, False) for v, lab in p) for p in parts]
+    counts: dict[str, int] = {}
+    for k in plain:
+        counts[k] = counts.get(k, 0) + 1
+    # Rows whose plain key is shared get every part qualified; distinct value tuples keep them apart.
+    return [
+        ", ".join(part(v, lab, True) for v, lab in p) if counts[k] > 1 else k
+        for p, k in zip(parts, plain)
+    ]
 
 
 def sn_aggregate(
@@ -139,6 +191,6 @@ def sn_aggregate(
     if not group_fields:
         return _parse_stats(rows[0].get("stats", {}), count, field_aggs) if rows else {}
     return {
-        _group_key(row, group_fields, display_value): _parse_stats(row.get("stats", {}), count, field_aggs)
-        for row in rows
+        key: _parse_stats(row.get("stats", {}), count, field_aggs)
+        for key, row in zip(_group_keys(rows, group_fields, display_value), rows)
     }

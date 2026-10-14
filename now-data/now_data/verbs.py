@@ -16,6 +16,7 @@ from typing import Any
 
 from now_data.aggregate import sn_aggregate
 from now_data.client import get_client
+from now_data.names import check_table
 
 __all__ = ["now_query", "now_get", "now_aggregate", "now_update", "now_run_script"]
 
@@ -55,7 +56,7 @@ def now_query(
     effective_limit = max(1, min(limit, MAX_LIMIT))
     field_list = _split(fields)
 
-    gr = get_client().GlideRecord(table)
+    gr = get_client().GlideRecord(check_table(table))
     if query:
         gr.add_encoded_query(query)
     if field_list:
@@ -87,7 +88,7 @@ def now_get(
     as a bad sys_id, not an empty result.
     """
     field_list = _split(fields)
-    gr = get_client().GlideRecord(table)
+    gr = get_client().GlideRecord(check_table(table))
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "
@@ -153,7 +154,7 @@ def now_update(
 
     Raises ValueError if no record with that sys_id exists.
     """
-    gr = get_client().GlideRecord(table)
+    gr = get_client().GlideRecord(check_table(table))
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "
