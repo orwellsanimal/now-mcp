@@ -25,14 +25,42 @@ if TYPE_CHECKING:
 # needed once a verb actually talks to the instance.
 _client: "ServiceNowClient | None" = None
 _awake = False
+# Set by configure(): explicit credentials win over SN_* env / .env.
+_explicit: tuple[str, str, str] | None = None
 
 
 class ConfigError(RuntimeError):
     """Raised when SN_* credentials are missing — distinct from instance errors."""
 
 
+def instance_url(instance: str) -> str:
+    """`dev123` or `dev123.service-now.com` or a full URL -> `https://dev123.service-now.com`."""
+    instance = instance.strip().rstrip("/")
+    if instance.startswith(("http://", "https://")):
+        return instance
+    if "." not in instance:
+        instance = f"{instance}.service-now.com"
+    return f"https://{instance}"
+
+
+def configure(instance: str, user: str, password: str) -> None:
+    """Use these credentials instead of SN_INSTANCE / SN_USER / SN_PASSWORD.
+
+    For library callers that resolve credentials their own way. Drops any
+    cached client, so the next verb connects (and wakes the instance) afresh.
+    """
+    global _explicit, _client, _awake
+    if not (instance and user and password):
+        raise ConfigError("configure() needs a non-empty instance, user and password.")
+    _explicit = (instance_url(instance), user, password)
+    _client = None
+    _awake = False
+
+
 def _creds() -> tuple[str, str, str]:
-    """Return (instance, user, password) from the environment / nearest .env."""
+    """Return (instance URL, user, password): from configure(), else the env / nearest .env."""
+    if _explicit is not None:
+        return _explicit
     # find_dotenv walks up from cwd; explicit env vars still win if already set.
     load_dotenv(find_dotenv(usecwd=True))
     instance = os.getenv("SN_INSTANCE")
@@ -44,7 +72,7 @@ def _creds() -> tuple[str, str, str]:
             "environment or a .env file). now-data talks to a live instance "
             "and cannot run without credentials."
         )
-    return instance, user, password
+    return instance_url(instance), user, password
 
 
 def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 120) -> None:
