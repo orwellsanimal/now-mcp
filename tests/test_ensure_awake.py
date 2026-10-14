@@ -33,6 +33,8 @@ class Resp:
 def wake(monkeypatch):
     """Feed ensure_awake a script of urlopen outcomes; count the sleeps between tries."""
     state = {"sleeps": 0, "calls": 0}
+    # No proxy unless a test sets one: not this machine's environment or registry settings.
+    monkeypatch.setattr(client, "getproxies", lambda: {}, raising=False)
 
     def run(*outcomes, timeout_s=120):
         script = list(outcomes)
@@ -86,7 +88,44 @@ def test_an_untrusted_certificate_fails_at_once_and_keeps_the_reason(wake):
     assert "CERTIFICATE_VERIFY_FAILED" in msg and "SSL_CERT_FILE" in msg and "Windows certificate store" in msg, msg
 
 
+@pytest.fixture
+def via_proxy(monkeypatch, wake):
+    """urllib would send the request through a proxy (with credentials in its URL)."""
+    def use(bypass=False):
+        monkeypatch.setattr(client, "getproxies", lambda: {"https": "http://bob:s3cret@corp-proxy.invalid:8080"}, raising=False)
+        monkeypatch.setattr(client, "proxy_bypass", lambda host: bypass, raising=False)
+    return use
+
+
+def _gaierror():
+    return URLError(socket.gaierror(11001, "getaddrinfo failed"))
+
+
+def test_through_a_proxy_a_name_that_does_not_resolve_is_the_proxys(wake, via_proxy):
+    via_proxy()
+    with pytest.raises(client.ConfigError) as caught:
+        wake(_gaierror())
+    msg = str(caught.value)
+    assert "proxy host 'corp-proxy.invalid' does not resolve" in msg and "HTTPS_PROXY" in msg, msg
+    assert "SN_INSTANCE" not in msg and "s3cret" not in msg and "bob" not in msg, msg
+
+
+def test_a_bypassed_proxy_still_blames_the_instance_name(wake, via_proxy):
+    via_proxy(bypass=True)
+    with pytest.raises(client.ConfigError, match="'dev123.service-now.com' does not resolve.*SN_INSTANCE"):
+        wake(_gaierror())
+
+
+@pytest.mark.parametrize("status", ["407 Proxy Authentication Required", "403 Forbidden"])
+def test_a_proxy_that_refuses_the_tunnel_fails_at_once_and_keeps_its_text(wake, status):
+    with pytest.raises(client.ConfigError) as caught:
+        wake(URLError(OSError(f"Tunnel connection failed: {status}")))
+    msg = str(caught.value)
+    assert f"Tunnel connection failed: {status}" in msg and "HTTPS_PROXY" in msg, msg
+
+
 @pytest.mark.parametrize("first", [
+    URLError(OSError("Tunnel connection failed: 502 Bad Gateway")),  # the proxy's upstream may come back
     _http(503, "text/html"),                 # waking
     _http(403, "text/html"),                 # a non-JSON 403 isn't the instance answering
     Resp("text/html"),                       # the hibernation page

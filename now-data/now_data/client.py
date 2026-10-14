@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import socket
 import ssl
 import time
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, getproxies, proxy_bypass, urlopen
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -90,13 +91,28 @@ def _creds() -> tuple[str, str, str]:
     return instance_url(instance), user, password
 
 
+# urllib's text when a proxy answers CONNECT with an error, e.g. "Tunnel connection failed: 407 Proxy
+# Authentication Required" (an OSError inside the URLError).
+_TUNNEL_REFUSED = re.compile(r"Tunnel connection failed: (\d{3})")
+
+
+def _https_proxy(instance_url: str) -> str | None:
+    """The proxy host urllib would send this request through, or None (no proxy, or bypassed)."""
+    proxy = getproxies().get("https")
+    host = urlsplit(instance_url).hostname or ""
+    if not proxy or proxy_bypass(host):
+        return None
+    return urlsplit(proxy if "://" in proxy else f"http://{proxy}").hostname  # never its user:pw@
+
+
 def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 120) -> None:
     """Block until the instance returns JSON to an authenticated API call.
 
     Waiting only helps a sleeping instance, so answers that waiting can't fix fail at once with
-    ConfigError: a 401 (now-mcp#2), a name that doesn't resolve (#10), a certificate that doesn't
-    verify. A JSON 403 means the instance is awake (the user just can't read sys_user), so it
-    returns. Anything else (5xx, the HTML wake page, a timeout, a refused connection) is retried.
+    ConfigError: a 401 (now-mcp#2), a name that doesn't resolve (#10; the proxy's, if urllib uses
+    one), a certificate that doesn't verify, a proxy that refuses the tunnel with a 4xx (407). A
+    JSON 403 means the instance is awake (the user just can't read sys_user), so it returns.
+    Anything else (5xx, the HTML wake page, a timeout, a refused connection) is retried.
 
     Raises RuntimeError if the instance does not wake within `timeout_s`.
     """
@@ -131,9 +147,21 @@ def ensure_awake(instance_url: str, user: str, password: str, timeout_s: int = 1
                 return
         except URLError as e:
             if isinstance(e.reason, socket.gaierror):
+                proxy = _https_proxy(instance_url)
+                if proxy:  # urllib resolves the proxy, not the instance: name the host that failed
+                    raise ConfigError(
+                        f"the proxy host {proxy!r} does not resolve ({e.reason}); check HTTPS_PROXY "
+                        "and NO_PROXY."
+                    ) from None
                 raise ConfigError(
                     f"could not reach the instance: {urlsplit(instance_url).hostname!r} does not resolve "
                     f"({e.reason}); check SN_INSTANCE."
+                ) from None
+            tunnel = _TUNNEL_REFUSED.match(str(e.reason))
+            if tunnel and tunnel.group(1).startswith("4"):  # 407 needs credentials, 403 is policy; a 5xx may pass
+                raise ConfigError(
+                    f"the proxy refused the connection to {instance_url} ({e.reason}); check HTTPS_PROXY "
+                    "(and its credentials, for a 407) and NO_PROXY."
                 ) from None
             if isinstance(e.reason, ssl.SSLCertVerificationError):
                 raise ConfigError(
