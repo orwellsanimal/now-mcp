@@ -127,8 +127,8 @@ def _field_problem(client: Any, table: str, field: str) -> tuple[str, dict | Non
     return "", column
 
 
-def _value_problem(field: str, column: dict, operator: str, value: str) -> str:
-    """Problem with a choice field compared to something it does not store, else ""."""
+def _value_problem(field: str, column: dict, operator: str, value: str, write: bool = False) -> str:
+    """Problem with a choice field compared to (or, with `write`, set to) something it doesn't store, else ""."""
     choices = column.get("choices") or []
     if not choices or value.startswith("javascript:"):
         return ""
@@ -151,6 +151,11 @@ def _value_problem(field: str, column: dict, operator: str, value: str) -> str:
     values = value.split(",") if operator in ("IN", "NOT IN") else [value]
     fixed, labels = [], []
     for v in (v.strip() for v in values):
+        if write and not v and "" not in stored:
+            # In a query an empty value means "is empty"; as a write it blanks a field whose
+            # choice list has no empty entry, which is rarely meant.
+            return (f"{field} has no empty choice, so setting it to '' would blank it; its values "
+                    f"are {listed}")
         number = float(v) if numeric and _PLAIN_NUMBER.fullmatch(v) else None
         if not v or v.lower() in stored or (number is not None and (
                 number in as_number or operator in (">", ">=", "<", "<="))):
@@ -226,7 +231,7 @@ def _problems(client: Any, table: str, query: str, fields: dict[str, list[str]],
     for name, value in values.items():
         column = columns.get(name)
         if column is not None and value is not None:
-            problem = _value_problem(name, column, "=", str(value))
+            problem = _value_problem(name, column, "=", str(value), write=True)
             if problem:
                 problems.append(f"values: {problem}")
     return problems
