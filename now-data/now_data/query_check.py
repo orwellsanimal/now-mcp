@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from now_data.transport import connection_problem
+
 # (connect, read) seconds; PySNC's session sets no timeout.
 TIMEOUT = (10, 60)
 
@@ -86,17 +88,13 @@ def table_columns(client: Any, table: str) -> dict:
     key = (client.instance, table)
     if key in _COLUMNS:
         return _COLUMNS[key]
-    import requests  # PySNC's own dependency; imported here so module load stays light
     url = f"{client.instance.rstrip('/')}/api/now/ui/meta/{table}"
     try:
         resp = client.session.get(url, headers={"Accept": "application/json"}, timeout=TIMEOUT)
     except Exception as e:  # a timeout or a dropped connection: can't check, so don't count
-        if isinstance(e, requests.ConnectionError) and not isinstance(e, requests.Timeout):
-            # Instance down, DNS, refused (ConnectTimeout is both, and stays a timeout). Still fails closed.
-            raise FieldsUnreadable(
-                f"could not read the fields of {table!r}: could not reach the instance ({type(e).__name__}); "
-                "check SN_INSTANCE and that the instance is up. Nothing was run."
-            ) from None
+        problem = connection_problem(e)
+        if problem:  # down, DNS, refused, TLS or proxy. Still fails closed.
+            raise FieldsUnreadable(f"could not read the fields of {table!r}: {problem}. Nothing was run.") from None
         raise FieldsUnreadable(
             f"could not read the fields of {table!r} to check the request ({type(e).__name__}: {e}); "
             "nothing was run."

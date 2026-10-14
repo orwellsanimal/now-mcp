@@ -310,3 +310,42 @@ def test_a_ui_meta_timeout_is_not_called_unreachable(client):
     with pytest.raises(query_check.FieldsUnreadable, match="could not read the fields.*ConnectTimeout") as caught:
         verbs.now_aggregate("incident", query="state=1")
     assert "could not reach" not in str(caught.value)
+
+
+# SSLError and ProxyError are ConnectionErrors too. "Check SN_INSTANCE" is the wrong advice for
+# them, and the exception text is the diagnosis (a TLS-inspecting proxy's self-signed chain), so
+# it must survive (now-mcp#11).
+_CERT = "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain"
+
+
+def _transport_cases():
+    import requests
+    return [
+        (requests.exceptions.SSLError(_CERT), ["TLS connection", "CERTIFICATE_VERIFY_FAILED", "REQUESTS_CA_BUNDLE"]),
+        (requests.exceptions.ProxyError("Unable to connect to proxy: 407 Proxy Authentication Required"),
+         ["proxy failed", "407 Proxy Authentication Required", "HTTPS_PROXY"]),
+        (requests.ConnectionError("Name or service not known"),
+         ["could not reach the instance", "Name or service not known", "SN_INSTANCE"]),
+    ]
+
+
+@pytest.mark.parametrize("case", range(3), ids=["ssl", "proxy", "plain"])
+def test_a_transport_failure_at_the_field_check_keeps_its_cause(client, case):
+    exc, wanted = _transport_cases()[case]
+    client.session = DownSession(exc)
+    with pytest.raises(query_check.FieldsUnreadable) as caught:
+        verbs.now_aggregate("incident", query="state=1")
+    msg = str(caught.value)
+    assert all(w in msg for w in wanted), msg
+    assert ("SN_INSTANCE" in msg) == (case == 2), msg  # only a plain ConnectionError points at the name
+
+
+@pytest.mark.parametrize("case", range(3), ids=["ssl", "proxy", "plain"])
+def test_a_transport_failure_at_the_stats_call_keeps_its_cause(client, case):
+    exc, wanted = _transport_cases()[case]
+    client.session = FakeSession(exc)  # UI Meta answers; only the Stats call fails
+    with pytest.raises(RuntimeError) as caught:
+        verbs.now_aggregate("incident")
+    msg = str(caught.value)
+    assert msg.startswith("Stats API on incident: ") and all(w in msg for w in wanted), msg
+    assert ("SN_INSTANCE" in msg) == (case == 2), msg

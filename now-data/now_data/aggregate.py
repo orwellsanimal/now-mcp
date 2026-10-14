@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Union
 
 from now_data.names import check_table
+from now_data.transport import connection_problem
 
 if TYPE_CHECKING:
     # Type-only: pysnc is never imported at module load so the server can list
@@ -74,11 +75,8 @@ def _get_stats(client: "ServiceNowClient", table: str, params: dict[str, str]) -
             f"Stats API for {table} did not answer within {TIMEOUT[1]}s ({type(e).__name__}); "
             "the instance may be slow or hibernating."
         ) from None
-    except requests.ConnectionError as e:  # instance down, DNS, refused: after Timeout (ConnectTimeout is both)
-        raise RuntimeError(
-            f"could not reach the instance for the Stats API on {table} ({type(e).__name__}); "
-            "check SN_INSTANCE and that the instance is up."
-        ) from None
+    except requests.ConnectionError as e:  # after Timeout (ConnectTimeout is both); TLS and proxy errors too
+        raise RuntimeError(f"Stats API on {table}: {connection_problem(e)}.") from None
     if resp.status_code in (401, 403):
         raise RuntimeError(
             f"Stats API refused the request (HTTP {resp.status_code}) for {table}: "
