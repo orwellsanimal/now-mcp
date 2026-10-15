@@ -5,7 +5,7 @@ ServiceNow verbs for AI agents and scripts, packaged two ways: as plain Python f
 | Package | What it answers | Needs |
 |---|---|---|
 | [`now-config`](now-config/README.md) | "Does this table/field/choice/role/property exist?", from an exported **instance-config snapshot** | nothing (stdlib) |
-| [`now-data`](now-data/README.md) | "What's on the instance right now?": query, get, aggregate, plus **gated** writes (`confirmed=False` is a dry run) | `pysnc`, `python-dotenv`, credentials |
+| [`now-data`](now-data/README.md) | "What's on the instance right now?": query, get, aggregate, plus **gated** writes (`confirmed=False` is a dry run), and `now-mcp-export`, which writes the snapshot now-config reads | `pysnc`, `python-dotenv`, credentials |
 
 ## Library first, MCP optional
 

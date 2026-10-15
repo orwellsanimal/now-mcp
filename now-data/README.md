@@ -95,3 +95,38 @@ verbs.now_query("incident", "active=true^priority=1", fields="number,short_descr
 preview = verbs.now_update("incident", sys_id, {"state": "2"})          # writes nothing
 verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # writes
 ```
+
+## Exporting a snapshot for now-config
+
+now-config answers from an instance-config snapshot. This writes one from the instance in `SN_INSTANCE`, with nothing but this package. You don't need Node or servicenow-coder's exporter.
+
+```bat
+now-mcp-export --out C:\snapshots\my-instance
+set INSTANCE_CONFIG_ROOT=C:\snapshots\my-instance
+```
+
+`python -m now_data.export --out ...` runs the same thing. now-config then reads the snapshot from `INSTANCE_CONFIG_ROOT`.
+
+```python
+from now_data.export import export_snapshot
+report = export_snapshot(r"C:\snapshots\my-instance")   # {written, skipped, warnings, ...}
+```
+
+- **What it writes.** It writes the files now-config reads, in the same shapes as servicenow-coder's `export-instance.js`:
+  - `schema/` (tables, columns, choices);
+  - `platform/` (properties, scopes);
+  - `security/roles.json`;
+  - `catalog/items.json`;
+  - `instance.json`.
+
+  `--only schema,platform,security,catalog` picks sections.
+- **Schema is required.** If a schema table fails to read, or the user can read none of its rows, the export fails, because an empty schema would say "doesn't exist" to everything. The other sections are best-effort: a failure skips the section and says why.
+- **All or nothing.** Everything is read before anything is written, so a failed export leaves the directory as it was. `instance.json` is removed before the writes and written last, so a run that dies while writing leaves no file claiming the directory holds one instance's snapshot.
+- **Every page is checked.** PySNC's own paging raises only on a 401, so a 403, a 5xx or the wake page partway through would end with a short file and no error. This pages the Table API itself, by `sys_id`, and fails on any bad page, including one without `X-Total-Count`.
+- **Rows hidden by ACLs are reported, not ignored.** For example, `sys_dictionary: read 170427 of 170762 rows`. Even an admin-level user sees this on a PDI. A snapshot can't answer about rows its user can't read.
+- **A hidden page doesn't end the read.** ACLs remove rows after the database picks a page, so a page can come back empty while rows remain. The exporter steps over it with an offset inside the same `sys_id` query, and stops only when it has passed every remaining row.
+- **Secrets.** Property values are redacted to `[REDACTED]` by the same three rules as servicenow-coder's `redact.js`: a password type, a credential prefix or PEM key, or a secret-looking name with an opaque value.
+- **Re-exporting.** Files are replaced atomically. When the directory held another instance's export, every file of a section this run didn't write (skipped, or left out by `--only`) is deleted. Files from servicenow-coder's Node exporter that this one doesn't write (`relationships.json`, ACLs, plugins, REST APIs) are left in place, with a warning. When it's the same instance, earlier files are kept.
+- **Time.** On a PDI (170k dictionary rows) the full export took 7 min 49 s, nearly all of it `sys_dictionary`. A production instance's dictionary is usually larger.
+
+A snapshot belongs to its instance: choice values differ between instances, so export from the one you'll ask about.
