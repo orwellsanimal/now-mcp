@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from now_data.aggregate import _error_detail
-from now_data.client import get_client
+from now_data.client import ConfigError, get_client, instance_url
 from now_data.redact import redact_secret_value
 from now_data.transport import connection_problem
 
@@ -334,6 +334,18 @@ def _write_json(path: Path, doc: dict) -> None:
         raise
 
 
+def _same_instance(a: str | None, b: str) -> bool:
+    """Do two instance URLs name the same instance? `https://x.service-now.com/` and
+    `https://X.service-now.com` do: a raw string compare would call them different and delete
+    the other sections' files of a re-export (now-mcp#16)."""
+    if not a:
+        return False
+    try:
+        return instance_url(a).lower() == instance_url(b).lower()
+    except ConfigError:
+        return False
+
+
 def _previous_instance(out: Path) -> str | None:
     try:
         return json.loads((out / "instance.json").read_text(encoding="utf-8")).get("instance_url")
@@ -443,7 +455,7 @@ def export_snapshot(
         _write_json(out / rel, doc)
         key = next(k for k in doc if not k.startswith("_") and k != "$schema")
         report["written"][rel] = len(doc[key])
-    if previous != instance:
+    if not _same_instance(previous, instance):
         for section in SECTIONS:
             for rel in _section_files(section):
                 if rel not in docs and (out / rel).exists():
@@ -474,6 +486,14 @@ def main(argv: list[str] | None = None) -> int:
         report = export_snapshot(args.out, only=only, log=print)
     except (ExportError, ValueError, RuntimeError) as e:
         print(f"export failed: {e}", file=sys.stderr)
+        return 1
+    if not report["written"]:
+        # Nothing on disk: a caller (rio) must not read this as a snapshot made (now-mcp#16).
+        print(f"export failed: nothing exported from {report['instance']}", file=sys.stderr)
+        for section, reason in report["skipped"].items():
+            print(f"  SKIPPED {section}: {reason}", file=sys.stderr)
+        for w in report["warnings"]:
+            print(f"  warning: {w}", file=sys.stderr)
         return 1
     print(f"Exported {report['instance']} to {report['out_dir']}")
     for rel, n in report["written"].items():

@@ -388,6 +388,48 @@ def test_cli_reports_and_exits_nonzero_on_failure(tmp_path, monkeypatch, capsys)
     assert "export failed: sys_db_object: 0 of 0 rows" in capsys.readouterr().err
 
 
+FORBIDDEN = Resp(403, {"error": {"message": "User Not Authorized"}}, reason="Forbidden")
+
+
+def test_cli_fails_when_nothing_was_written(tmp_path, monkeypatch, capsys):
+    # now-mcp#16: every chosen section skipped -> no files, so not a success.
+    monkeypatch.setattr(export, "get_client", lambda: Client(Instance(fail={"sys_properties": (0, FORBIDDEN)})))
+    assert export.main(["--out", str(tmp_path), "--only", "platform"]) == 1
+    out, err = capsys.readouterr()
+    assert "Exported" not in out
+    assert "nothing exported from https://corp.service-now.com" in err and "SKIPPED platform" in err
+    assert not any(tmp_path.iterdir())
+
+
+def test_cli_succeeds_when_only_optional_sections_are_skipped(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(export, "get_client", lambda: Client(Instance(fail={"sc_cat_item": (0, FORBIDDEN)})))
+    assert export.main(["--out", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Exported" in out and "SKIPPED catalog" in out
+
+
+@pytest.mark.parametrize("previous", [
+    "https://corp.service-now.com/", "https://CORP.service-now.com", "corp", "corp.service-now.com",
+    "https://corp.service-now.com/now/nav/ui/home",
+])
+def test_the_same_instance_written_differently_keeps_its_files(tmp_path, previous):
+    # now-mcp#16: a raw string compare called these "another instance" and deleted 4 sections' files.
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": previous}))
+    report, _ = run(tmp_path, only=["schema"])
+    assert report["removed"] == []
+    assert (tmp_path / "platform/properties.json").exists() and (tmp_path / "catalog/items.json").exists()
+
+
+@pytest.mark.parametrize("previous", ["https://lab.service-now.com", "not a url at all ::", ""])
+def test_another_or_unreadable_instance_still_counts_as_another(tmp_path, previous):
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": previous}))
+    report, _ = run(tmp_path, only=["schema"])
+    assert sorted(report["removed"]) == ["catalog/items.json", "platform/properties.json",
+                                         "platform/scopes.json", "security/roles.json"]
+
+
 # --- redaction: the cases from servicenow-coder's redact.test.js -----------------------
 
 @pytest.mark.parametrize("name,value,type_", [
