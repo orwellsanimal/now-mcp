@@ -410,7 +410,8 @@ def test_cli_succeeds_when_only_optional_sections_are_skipped(tmp_path, monkeypa
 
 @pytest.mark.parametrize("previous", [
     "https://corp.service-now.com/", "https://CORP.service-now.com", "corp", "corp.service-now.com",
-    "https://corp.service-now.com/now/nav/ui/home",
+    "https://corp.service-now.com/now/nav/ui/home", "https://corp.service-now.com:443",
+    "http://corp.service-now.com", "https://corp.service-now.com.",
 ])
 def test_the_same_instance_written_differently_keeps_its_files(tmp_path, previous):
     # now-mcp#16: a raw string compare called these "another instance" and deleted 4 sections' files.
@@ -465,3 +466,17 @@ def test_redacted(name, value, type_):
 ])
 def test_kept(name, value, type_):
     assert redact_secret_value(name, value, type_) == value
+
+
+def test_an_optional_section_with_every_row_hidden_is_skipped_not_emptied(tmp_path):
+    # #17 review: a 0-readable optional table wrote {} over a good file and exited 0.
+    run(tmp_path)
+    report, _ = run(tmp_path, Instance(hidden={"sc_cat_item": {"c1"}}), only=["catalog"])
+    assert report["written"] == {} and "0 of 1 rows readable" in report["skipped"]["catalog"]
+    assert load(tmp_path, "catalog/items.json")["items"] != {}  # the earlier file is kept
+
+
+def test_an_optional_table_that_is_really_empty_is_written_empty(tmp_path):
+    report, _ = run(tmp_path, Instance({**TABLES, "sc_cat_item": []}), only=["schema", "catalog"])
+    assert report["written"]["catalog/items.json"] == 0
+    assert any("sc_cat_item: 0 rows; the table is empty" in w for w in report["warnings"])

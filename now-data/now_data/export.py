@@ -31,6 +31,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from now_data.aggregate import _error_detail
@@ -334,14 +335,21 @@ def _write_json(path: Path, doc: dict) -> None:
         raise
 
 
+def _instance_key(url: str) -> tuple[str, int | None]:
+    """(host, port) of an instance URL, ignoring case, scheme, path and a default port."""
+    parts = urlsplit(instance_url(url))
+    host = (parts.hostname or "").rstrip(".")
+    return host, None if parts.port in (None, 80, 443) else parts.port
+
+
 def _same_instance(a: str | None, b: str) -> bool:
-    """Do two instance URLs name the same instance? `https://x.service-now.com/` and
-    `https://X.service-now.com` do: a raw string compare would call them different and delete
-    the other sections' files of a re-export (now-mcp#16)."""
+    """Do two instance URLs name the same instance? `https://x.service-now.com/`, `X`,
+    `x.service-now.com:443` and `http://x.service-now.com` do: a raw string compare would call
+    them different and delete the other sections' files of a re-export (now-mcp#16)."""
     if not a:
         return False
     try:
-        return instance_url(a).lower() == instance_url(b).lower()
+        return _instance_key(a) == _instance_key(b)
     except ConfigError:
         return False
 
@@ -428,7 +436,9 @@ def export_snapshot(
                 if not rows:
                     if section == REQUIRED:  # an empty schema would answer "doesn't exist" to everything
                         raise ExportError(f"{table}: 0 of {total} rows readable. The user needs read access to it.")
-                    report["warnings"].append(f"{table}: 0 of {total} rows readable; read ACLs hide them.")
+                    if total:  # rows exist but none is readable: skip, so a good earlier file isn't emptied
+                        raise ExportError(f"{table}: 0 of {total} rows readable; read ACLs hide them all.")
+                    report["warnings"].append(f"{table}: 0 rows; the table is empty.")
                 elif len(rows) < total:
                     report["warnings"].append(
                         f"{table}: read {len(rows)} of {total} rows; read ACLs hid the rest, so the snapshot "
