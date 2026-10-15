@@ -101,9 +101,11 @@ verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # write
 now-config answers from an instance-config snapshot. This writes one from the instance in `SN_INSTANCE`, with nothing but this package. You don't need Node or servicenow-coder's exporter.
 
 ```bat
-now-mcp-export --out C:\snapshots\my-instance          # or: python -m now_data.export --out ...
-set INSTANCE_CONFIG_ROOT=C:\snapshots\my-instance      # then now-config reads it
+now-mcp-export --out C:\snapshots\my-instance
+set INSTANCE_CONFIG_ROOT=C:\snapshots\my-instance
 ```
+
+`python -m now_data.export --out ...` runs the same thing. now-config then reads the snapshot from `INSTANCE_CONFIG_ROOT`.
 
 ```python
 from now_data.export import export_snapshot
