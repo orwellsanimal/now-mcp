@@ -63,6 +63,8 @@ def _get_page(client: "ServiceNowClient", table: str, params: dict[str, str], wh
         raise ExportError(f"{table}: no answer within {TIMEOUT[1]}s {where} ({type(e).__name__}).") from None
     except requests.ConnectionError as e:
         raise ExportError(f"{table}: {connection_problem(e)}.") from None
+    except requests.RequestException as e:  # a broken chunked body, too many redirects, ...
+        raise ExportError(f"{table}: the request failed {where} ({type(e).__name__}: {e}).") from None
     if resp.status_code >= 400:
         raise ExportError(f"{table}: HTTP {resp.status_code} {where}: {_error_detail(resp) or resp.reason}.")
     if "application/json" not in resp.headers.get("Content-Type", ""):
@@ -70,47 +72,65 @@ def _get_page(client: "ServiceNowClient", table: str, params: dict[str, str], wh
             f"{table}: answered {resp.headers.get('Content-Type') or 'no content type'}, not JSON, {where}; "
             "the instance may be hibernating. Wake it and export again."
         )
+    try:
+        result = resp.json().get("result")
+    except (ValueError, AttributeError) as e:
+        raise ExportError(f"{table}: the JSON {where} didn't parse ({type(e).__name__}: {e}).") from None
+    if not isinstance(result, list):
+        raise ExportError(f"{table}: no result list {where}.")
     total = resp.headers.get("X-Total-Count")
-    return resp.json().get("result", []), int(total) if total and total.isdigit() else None
+    return result, int(total) if total and total.isdigit() else None
 
 
 def fetch_all(client: "ServiceNowClient", table: str, query: str, fields: list[str], display: bool = False
-              ) -> tuple[list[dict], int | None]:
-    """Every row of `table` matching `query`.
+              ) -> tuple[list[dict], int]:
+    """Every row of `table` matching `query` that the user can read.
 
     A cell is the raw value, or {value, display_value} when `display` is set (about 4x
     slower on sys_dictionary, so only the tables that keep a label ask for it).
 
     Pages by keyset (`sys_id>last`, ordered by sys_id), not by offset: an offset page
-    gets slower the deeper it is (sys_dictionary on a PDI: 2.7 s at 0, 14 s at 160k),
-    and rows inserted mid-export can't shift a page. Returns (rows, total), where total
-    is the instance's count before ACLs; fewer rows than that means ACLs hid some, and
-    the caller reports it. A page that ACLs shortened is not the last page: only an
-    empty page ends the loop.
+    gets slower the deeper it is (sys_dictionary on a PDI: 2.7 s at 0, 14 s at 160k).
+
+    Read ACLs remove rows from a page after the database picked it, so a page can come
+    back short or empty while rows remain. X-Total-Count is the number of rows past
+    `last` before ACLs. A short page moves `last` on; an empty page has no sys_id to
+    move on from, so the next request steps over it with an offset inside the same
+    keyset query. The loop ends only when that offset has passed every remaining row.
+
+    Returns (rows, total), where total is the instance's count before ACLs; the
+    difference is the rows ACLs hid.
     """
     base = {
         "sysparm_fields": ",".join(dict.fromkeys(["sys_id", *fields])),
         "sysparm_display_value": "all" if display else "false",
         "sysparm_exclude_reference_link": "true",
         "sysparm_limit": str(PAGE),
-        "sysparm_offset": "0",
     }
     rows: list[dict] = []
     total: int | None = None
     last = ""
+    skip = 0  # rows past `last` already known to be hidden
     while True:
         terms = [t for t in (query, f"sys_id>{last}" if last else "") if t]
-        params = {**base, "sysparm_query": "^".join([*terms, "ORDERBYsys_id"])}
-        page, page_total = _get_page(client, table, params, f"after sys_id {last!r}" if last else "on the first page")
+        params = {**base, "sysparm_query": "^".join([*terms, "ORDERBYsys_id"]), "sysparm_offset": str(skip)}
+        where = (f"after sys_id {last!r}" if last else "on the first page") + (f" (+{skip})" if skip else "")
+        page, remaining = _get_page(client, table, params, where)
+        if remaining is None:  # without it an empty page can't tell "done" from "hidden"
+            raise ExportError(f"{table}: no X-Total-Count header {where}, so the end of the table can't be confirmed.")
         if total is None:
-            total = page_total
+            total = remaining
         if not page:
-            break
+            skip += PAGE
+            if skip >= remaining:
+                break
+            continue
         rows.extend(page)
         nxt = _v(page[-1], "sys_id")
-        if not nxt or nxt <= last:  # can't advance: stop loudly rather than loop or skip
+        # Only equality: the server orders by its collation, which needn't agree with Python's `<`.
+        if not nxt or nxt == last:
             raise ExportError(f"{table}: paging stalled after sys_id {last!r} (the page's last sys_id was {nxt!r}).")
-        last = nxt
+        last, skip = nxt, 0
     return rows, total
 
 
@@ -135,8 +155,18 @@ def _int(s: str) -> int:
         return 0
 
 
-def _doc(source: str, description: str, key: str, data: Any) -> dict:
-    return {"_source": source, "_description": description, key: data}
+# The JSON Schema servicenow-coder keeps for each file, named as export-instance.js names it.
+_SCHEMAS = {"tables": "tables", "columns": "columns", "choices": "choices", "properties": "properties",
+            "scopes": "scopes", "roles": "roles", "items": "catalog-items"}
+# Lists inside a mapping, in a stable order (rows arrive by sys_id), so re-exports diff cleanly.
+_LIST_ORDER = {"columns": lambda c: c["element"], "choices": lambda c: (c["sequence"], c["value"])}
+
+
+def _doc(source: str, description: str, key: str, data: dict) -> dict:
+    order = _LIST_ORDER.get(key)
+    data = {k: sorted(v, key=order) if order else v for k, v in sorted(data.items())}
+    return {"$schema": f"../schemas/{_SCHEMAS[key]}.schema.json", "_source": source,
+            "_description": description, key: data}
 
 
 # Each export reads one table and returns {relative path: document}. The shapes match
@@ -285,6 +315,11 @@ PLAN: dict[str, list[tuple[str, str, list[str], Callable[[list[dict]], dict]]]] 
 }
 
 
+# Files servicenow-coder's Node exporter writes that this one doesn't.
+_OTHER_FILES = ("schema/relationships.json", "platform/plugins.json", "security/acl-policies.json",
+                "services/rest-apis.json", "services/integrations.json")
+
+
 def _write_json(path: Path, doc: dict) -> None:
     """Write via a temp file and rename, so a crash never leaves half a file in place."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +349,30 @@ def _version() -> str:
         return "unknown"
 
 
+def _instance_info(client: "ServiceNowClient", instance: str) -> dict:
+    """instance.json. Best-effort: the build properties may be unreadable."""
+    info = {"$schema": "./schemas/instance.schema.json", "instance_url": instance, "family": "", "build": "",
+            "build_date": ""}
+    # Measured on a Brazil PDI: the tag is in glide.buildtag.last, not glide.buildtag (which
+    # export-instance.js reads, so its `build` was always blank), and glide.war carries it too.
+    try:
+        rows, _ = fetch_all(client, "sys_properties", "nameINglide.buildtag.last,glide.builddate.last,glide.war",
+                            ["name", "value"])
+    except ExportError:
+        rows = []
+    props = {_v(r, "name"): _v(r, "value") for r in rows}
+    info["build"] = props.get("glide.buildtag.last", "")
+    info["build_date"] = props.get("glide.builddate.last", "")
+    parts = (info["build"] or props.get("glide.war", "")).split("-")  # glide-<family>-<date>__patch...
+    if len(parts) > 1 and parts[0] == "glide":
+        info["family"] = parts[1]
+    return info
+
+
+def _section_files(section: str) -> list[str]:
+    return [rel for *_, build in PLAN[section] for rel in build([])]
+
+
 def export_snapshot(
     out_dir: str | os.PathLike,
     only: Iterable[str] | None = None,
@@ -323,15 +382,17 @@ def export_snapshot(
     """Export a snapshot of the connected instance into `out_dir`.
 
     `only` picks sections (default: all of schema, platform, security, catalog). The
-    schema section is the one now-config can't work without, so an error there raises
-    ExportError; an error in any other section skips that section and is reported.
+    schema section is the one now-config can't work without, so an error there, or a
+    schema table with no readable rows, raises ExportError. An error in any other
+    section skips that section and is reported.
 
-    A skipped section's file from an earlier export is kept if that export was of the
-    same instance, and removed if it was of another: a missing file errors clearly,
-    a file from the wrong instance answers wrongly.
+    Everything is read before anything is written, so a failed export leaves `out_dir`
+    as it was. If `out_dir` held an export of a different instance, every file of a
+    section this run didn't write is removed: a missing file errors clearly, a file
+    from the wrong instance answers wrongly. Files of the same instance are kept.
 
     Returns {instance, out_dir, written: {path: entries}, skipped: {section: reason},
-    warnings: [...]}.
+    removed: [...], warnings: [...]}.
     """
     sections = list(SECTIONS) if only is None else [s.strip() for s in only if s.strip()]
     unknown = [s for s in sections if s not in SECTIONS]
@@ -341,51 +402,60 @@ def export_snapshot(
     if client is None:
         client = get_client()
     instance = client.instance.rstrip("/")
-    previous = _previous_instance(out)
     report: dict[str, Any] = {"instance": instance, "out_dir": str(out), "written": {}, "skipped": {},
-                              "warnings": []}
+                              "removed": [], "warnings": []}
 
+    # 1. Read everything.
+    docs: dict[str, dict] = {}
     for section in sections:
-        docs: dict[str, dict] = {}
+        section_docs: dict[str, dict] = {}
         try:
             for table, query, fields, build in PLAN[section]:
                 log(f"  {table}...")
                 rows, total = fetch_all(client, table, query, fields, display=table in DISPLAY_TABLES)
-                if total is not None and len(rows) < total:
+                if not rows:
+                    if section == REQUIRED:  # an empty schema would answer "doesn't exist" to everything
+                        raise ExportError(f"{table}: 0 of {total} rows readable. The user needs read access to it.")
+                    report["warnings"].append(f"{table}: 0 of {total} rows readable; read ACLs hide them.")
+                elif len(rows) < total:
                     report["warnings"].append(
                         f"{table}: read {len(rows)} of {total} rows; read ACLs hid the rest, so the snapshot "
                         "will not know about them."
                     )
-                elif not rows:
-                    if section == REQUIRED:  # an empty schema would answer "doesn't exist" to everything
-                        raise ExportError(f"{table}: 0 rows readable. The user needs read access to it.")
-                    report["warnings"].append(f"{table}: 0 rows. Usually a read ACL, not an empty table.")
-                docs.update(build(rows))
+                section_docs.update(build(rows))
         except ExportError as e:
             if section == REQUIRED:
                 raise
             report["skipped"][section] = str(e)
-            for _table, _q, _f, build in PLAN[section]:
-                for rel in build([]):
-                    stale = out / rel
-                    if stale.exists() and previous != instance:
-                        stale.unlink()
-                        report["warnings"].append(f"removed {rel}: it came from {previous or 'an unknown instance'}.")
             continue
-        exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for rel, doc in docs.items():
-            doc["_exported_at"] = exported_at
-            _write_json(out / rel, doc)
-            key = next(k for k in doc if not k.startswith("_"))
-            report["written"][rel] = len(doc[key])
+        docs.update(section_docs)
+    if not docs:
+        return report
+    info = _instance_info(client, instance)
 
-    if report["written"]:
-        _write_json(out / "instance.json", {
-            "instance_url": instance,
-            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "profile": "exported",
-            "exporter": f"now-mcp-data {_version()}",
-        })
+    # 2. Write. instance.json goes first and comes back last, so a write that dies part-way
+    # leaves no file claiming the directory is one instance's snapshot.
+    previous = _previous_instance(out)
+    (out / "instance.json").unlink(missing_ok=True)
+    exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for rel, doc in docs.items():
+        doc["_exported_at"] = exported_at
+        _write_json(out / rel, doc)
+        key = next(k for k in doc if not k.startswith("_") and k != "$schema")
+        report["written"][rel] = len(doc[key])
+    if previous != instance:
+        for section in SECTIONS:
+            for rel in _section_files(section):
+                if rel not in docs and (out / rel).exists():
+                    (out / rel).unlink()
+                    report["removed"].append(rel)
+        for rel in _OTHER_FILES:
+            if (out / rel).exists():
+                report["warnings"].append(
+                    f"{rel} is from {previous or 'an earlier export'}, not {instance}; now-config doesn't read it, "
+                    "but other tools might.")
+    _write_json(out / "instance.json", {**info, "exported_at": exported_at, "profile": "exported",
+                                        "exporter": f"now-mcp-data {_version()}"})
     return report
 
 
@@ -408,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Exported {report['instance']} to {report['out_dir']}")
     for rel, n in report["written"].items():
         print(f"  wrote {rel} ({n} entries)")
+    for rel in report["removed"]:
+        print(f"  removed {rel}: it was from another instance")
     for section, reason in report["skipped"].items():
         print(f"  SKIPPED {section}: {reason}")
     for w in report["warnings"]:

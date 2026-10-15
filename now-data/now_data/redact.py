@@ -25,7 +25,12 @@ SECRET_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 SECRET_PREFIX_RE = re.compile(r"^(AQ\.|AIza|sk-|ghp_|ghs_|gho_|ya29\.|glpat-|xox[baprs]-)")
-OPAQUE_TOKEN_RE = re.compile(r"^\S{16,}$")
+# JavaScript's \s, which is also what String.prototype.trim() strips. Python's \s and
+# str.strip() differ: they add \x1c-\x1f and drop \ufeff, so a BOM-prefixed token would
+# slip past the anchored prefix check here and not in redact.js.
+_JS_WS = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+_JS_TRIM_RE = re.compile(f"^[{_JS_WS}]+|[{_JS_WS}]+$")
+OPAQUE_TOKEN_RE = re.compile(f"^[^{_JS_WS}]{{16,}}$")
 PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _DIGITS_RE = re.compile(r"^\d+$", re.ASCII)  # JS \d is ASCII-only
 SECRET_TYPES = frozenset({"password", "password2"})
@@ -43,7 +48,7 @@ def redact_secret_value(name: str, value, *types: str):
         return REDACTED
     # The shape triggers are anchored, so test the trimmed value: a pasted token with a
     # stray space or trailing newline would otherwise slip past them.
-    trimmed = value.strip()
+    trimmed = _JS_TRIM_RE.sub("", value)
     if SECRET_PREFIX_RE.search(trimmed):
         return REDACTED
     if PEM_PRIVATE_KEY_RE.search(value):

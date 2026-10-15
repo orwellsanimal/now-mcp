@@ -41,7 +41,7 @@ TABLES = {
         row(sys_id="p1", name="glide.ui.title", value="Corp", description="Title", type=cell("string", "string"),
             sys_scope=cell("global", "Global")),
         row(sys_id="p2", name="glide.user.default_password", value="{{gpaes}}abc==", description="",
-            type=cell("password2", "Password (2 Way Encrypted)"), sys_scope=cell("global", "Global")),
+            type=cell("password2", "password2"), sys_scope=cell("global", "Global")),
         row(sys_id="p3", name="x_app.api_key", value="aB3dEfGhIjKlMnOpQrSt1234567890", description="",
             type=cell("string", "string"), sys_scope=cell("x_app", "My App")),
     ],
@@ -77,32 +77,43 @@ def sid(r):
     return c["value"] if isinstance(c, dict) else c
 
 
-class Instance:
-    """A Table API that pages by `sys_id>X^ORDERBYsys_id` like the real one.
+# As a Brazil PDI has them (glide.buildtag, which export-instance.js reads, doesn't exist there).
+BUILD = [row(sys_id="b1", name="glide.buildtag.last", value="glide-brazil-08-25-2026__patch0-08-26-2026"),
+         row(sys_id="b2", name="glide.builddate.last", value="09-22-2026_1636"),
+         row(sys_id="b3", name="glide.war", value="glide-brazil-08-25-2026__patch0-08-26-2026_09-22-2026_1636.zip")]
 
-    `fail` maps table -> (page number, Resp) to answer instead. `hidden` maps table -> how
-    many rows ACLs remove from its first page (still counted in X-Total-Count, as on a real
-    instance). Rows come back raw unless display_value=all is asked for.
+
+class Instance:
+    """A Table API that pages by `sys_id>X^ORDERBYsys_id` with an offset, like the real one.
+
+    `hidden` maps table -> sys_ids that read ACLs remove. As on a real instance they are
+    removed from a page after the database picked it, so they still count in
+    X-Total-Count and a page can come back short, or empty while rows remain.
+    `fail` maps table -> (request number, Resp) to answer instead. Rows come back raw
+    unless display_value=all is asked for.
     """
 
-    def __init__(self, tables=None, hidden=None, fail=None):
+    def __init__(self, tables=None, hidden=None, fail=None, build=None):
         self.tables = TABLES if tables is None else tables
+        self.build = BUILD if build is None else build
         self.hidden = hidden or {}
         self.fail = fail or {}
         self.gets = []
 
     def get(self, url, params=None, headers=None, timeout=None):
         table = url.rsplit("/", 1)[1]
-        assert params["sysparm_offset"] == "0" and params["sysparm_query"].endswith("ORDERBYsys_id")
-        after = next((t[len("sys_id>"):] for t in params["sysparm_query"].split("^") if t.startswith("sys_id>")), "")
+        terms = params["sysparm_query"].split("^")
+        assert terms[-1] == "ORDERBYsys_id"
+        after = next((t[len("sys_id>"):] for t in terms if t.startswith("sys_id>")), "")
         n = sum(1 for t, *_ in self.gets if t == table)
         self.gets.append((table, after, params))
         if table in self.fail and self.fail[table][0] == n:
             return self.fail[table][1]
-        rows = sorted((r for r in self.tables.get(table, []) if sid(r) > after), key=sid)
-        page = rows[:int(params["sysparm_limit"])]
-        if table in self.hidden and n == 0:
-            page = page[self.hidden[table]:]
+        build_lookup = "nameINglide.buildtag.last,glide.builddate.last,glide.war" in terms
+        source = self.build if build_lookup else self.tables.get(table, [])
+        rows = sorted((r for r in source if sid(r) > after), key=sid)
+        offset, limit = int(params["sysparm_offset"]), int(params["sysparm_limit"])
+        page = [r for r in rows[offset:offset + limit] if sid(r) not in self.hidden.get(table, ())]
         if params["sysparm_display_value"] == "false":
             page = [{k: v["value"] for k, v in r.items()} for r in page]
         return Resp(200, {"result": page}, {"X-Total-Count": str(len(rows))})
@@ -155,7 +166,7 @@ def test_shapes_match_the_node_exporter(tmp_path):
     assert load(tmp_path, "schema/tables.json")["tables"]["incident"] == {
         "sys_id": "t2", "label": "Incident", "super_class": "t1", "scope": "global", "is_extendable": True,
         "number_prefix": "INC", "access": "public"}
-    assert load(tmp_path, "schema/columns.json")["columns"]["task"][0] == {
+    assert load(tmp_path, "schema/columns.json")["columns"]["task"][1] == {
         "element": "state", "column_label": "State", "internal_type": "integer", "max_length": 40,
         "mandatory": False, "read_only": False, "active": True, "default_value": "1", "reference": "",
         "scope": "global"}
@@ -169,7 +180,6 @@ def test_shapes_match_the_node_exporter(tmp_path):
 def test_property_secrets_are_redacted_by_raw_type_name_or_shape(tmp_path):
     run(tmp_path)
     props = load(tmp_path, "platform/properties.json")["properties"]
-    # The display label "Password (2 Way Encrypted)" isn't a password type; the raw "password2" is.
     assert props["glide.user.default_password"]["value"] == REDACTED
     assert props["x_app.api_key"]["value"] == REDACTED
     assert props["glide.ui.title"]["value"] == "Corp"
@@ -190,7 +200,9 @@ def test_pages_by_keyset_until_an_empty_page(tmp_path, monkeypatch):
 
 def test_the_section_query_is_kept_and_display_values_asked_only_where_kept(tmp_path):
     _, s = run(tmp_path)
-    by_table = {t: p for t, after, p in s.gets if not after}  # each table's first page
+    by_table = {}
+    for t, _, p in s.gets:
+        by_table.setdefault(t, p)  # each table's first request (instance.json's build lookup comes later)
     assert by_table["sys_dictionary"]["sysparm_query"] == "internal_type!=collection^elementISNOTEMPTY^ORDERBYsys_id"
     assert by_table["sys_dictionary"]["sysparm_fields"].startswith("sys_id,name,element")
     assert {t for t, p in by_table.items() if p["sysparm_display_value"] == "all"} == {"sys_properties", "sys_user_role"}
@@ -202,15 +214,46 @@ def test_a_page_that_does_not_advance_stops_the_export(tmp_path):
         run(tmp_path, Instance(fail={"sys_db_object": (0, stuck)}))
 
 
-def test_rows_hidden_by_acls_keep_paging_and_are_reported(tmp_path, monkeypatch):
-    # A page that ACLs shortened is not the last page: stopping on a short page would drop rows.
+ROLES = [row(sys_id=f"r{i}", name=f"role{i}", description="", elevated_privilege="false",
+             sys_scope=cell("global", "Global")) for i in range(7)]
+
+
+@pytest.mark.parametrize("hidden,read", [
+    ({"r0"}, 6),                     # a short page is not the last page
+    ({"r2", "r3"}, 5),               # a whole page hidden mid-table: step over it, don't stop
+    ({"r2", "r3", "r4", "r5"}, 3),   # two hidden pages in a row
+    ({"r5", "r6"}, 5),               # a hidden tail: the end, not a stall
+    ({"r6"}, 6),
+])
+def test_rows_hidden_by_acls_never_end_the_read_early(tmp_path, monkeypatch, hidden, read):
     monkeypatch.setattr(export, "PAGE", 2)
-    big = [row(sys_id=f"r{i}", name=f"role{i}", description="", elevated_privilege="false",
-               sys_scope=cell("global", "Global")) for i in range(5)]
-    report, _ = run(tmp_path, Instance({**TABLES, "sys_user_role": big}, hidden={"sys_user_role": 1}),
+    report, _ = run(tmp_path, Instance({**TABLES, "sys_user_role": ROLES}, hidden={"sys_user_role": hidden}),
                     only=["security"])
-    assert report["written"] == {"security/roles.json": 4}
-    assert any("read 4 of 5 rows" in w for w in report["warnings"])
+    roles = load(tmp_path, "security/roles.json")["roles"]
+    assert sorted(roles) == sorted(f"role{i}" for i in range(7) if f"r{i}" not in hidden)
+    assert report["written"] == {"security/roles.json": read}
+    assert any(f"read {read} of 7 rows" in w for w in report["warnings"])
+
+
+def test_a_hidden_page_is_stepped_over_by_offset_inside_the_keyset(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, "PAGE", 2)
+    _, s = run(tmp_path, Instance({**TABLES, "sys_user_role": ROLES}, hidden={"sys_user_role": {"r2", "r3"}}),
+               only=["security"])
+    asked = [(after, p["sysparm_offset"]) for t, after, p in s.gets if t == "sys_user_role"]
+    assert asked == [("", "0"), ("r1", "0"), ("r1", "2"), ("r5", "0"), ("r6", "0")]
+
+
+def test_a_schema_table_with_every_row_hidden_fails(tmp_path):
+    # The rows exist (X-Total-Count says 2), the user can read none of them.
+    with pytest.raises(export.ExportError, match="sys_db_object: 0 of 2 rows readable"):
+        run(tmp_path, Instance(hidden={"sys_db_object": {"t1", "t2"}}))
+    assert not any(tmp_path.iterdir())
+
+
+def test_no_total_count_header_fails_rather_than_guessing(tmp_path):
+    no_header = Resp(200, {"result": []})
+    with pytest.raises(export.ExportError, match="sys_db_object: no X-Total-Count"):
+        run(tmp_path, Instance(fail={"sys_db_object": (0, no_header)}))
 
 
 @pytest.mark.parametrize("bad", [
@@ -225,9 +268,54 @@ def test_a_failed_schema_page_fails_the_export_and_writes_nothing(tmp_path, monk
     assert not (tmp_path / "schema").exists() and not (tmp_path / "instance.json").exists()
 
 
-def test_an_unreadable_schema_table_is_an_error_not_an_empty_snapshot(tmp_path):
-    with pytest.raises(export.ExportError, match="sys_db_object: 0 rows"):
+def test_an_empty_schema_table_is_an_error_not_an_empty_snapshot(tmp_path):
+    with pytest.raises(export.ExportError, match="sys_db_object: 0 of 0 rows"):
         run(tmp_path, Instance({**TABLES, "sys_db_object": []}))
+
+
+@pytest.mark.parametrize("bad", [
+    Resp(200, "not a dict"),               # JSON that isn't {result: [...]}
+    Resp(200, {"result": {"oops": 1}}),
+])
+def test_a_malformed_page_is_an_export_error(tmp_path, bad):
+    with pytest.raises(export.ExportError, match="sys_dictionary"):
+        run(tmp_path, Instance(fail={"sys_dictionary": (0, bad)}))
+
+
+def test_a_failed_export_leaves_the_previous_snapshot_untouched(tmp_path):
+    run(tmp_path)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*.json")}
+
+    class Boom(Instance):
+        def get(self, url, **kw):
+            if url.endswith("/sc_cat_item"):
+                raise KeyboardInterrupt  # not an ExportError: aborts the run, as Ctrl-C would
+            return super().get(url, **kw)
+
+    other = Client(Boom())
+    other.instance = "https://other.service-now.com"
+    with pytest.raises(KeyboardInterrupt):
+        export.export_snapshot(tmp_path, client=other)
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*.json")} == before
+
+
+def test_a_write_that_dies_part_way_leaves_no_instance_claim(tmp_path, monkeypatch):
+    run(tmp_path)
+    real, calls = export._write_json, []
+
+    def dies_on_second(path, doc):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        real(path, doc)
+
+    monkeypatch.setattr(export, "_write_json", dies_on_second)
+    other = Client(Instance())
+    other.instance = "https://other.service-now.com"
+    with pytest.raises(OSError):
+        export.export_snapshot(tmp_path, client=other)
+    # One file is now other's and the rest corp's: no instance.json may say it's all one instance.
+    assert not (tmp_path / "instance.json").exists()
 
 
 def test_an_optional_section_is_skipped_and_the_rest_written(tmp_path):
@@ -238,13 +326,32 @@ def test_an_optional_section_is_skipped_and_the_rest_written(tmp_path):
     assert (tmp_path / "schema/tables.json").exists()
 
 
+def test_family_falls_back_to_glide_war(tmp_path):
+    run(tmp_path, Instance(build=BUILD[2:]))
+    info = load(tmp_path, "instance.json")
+    assert info["family"] == "brazil" and info["build"] == ""
+
+
 def test_a_skipped_sections_file_from_another_instance_is_removed(tmp_path):
     run(tmp_path)  # a full export of corp
     (tmp_path / "instance.json").write_text(json.dumps({"instance_url": "https://lab.service-now.com"}))
     bad = Resp(403, {"error": {"message": "no"}})
     report, _ = run(tmp_path, Instance(fail={"sc_cat_item": (0, bad)}))
     assert not (tmp_path / "catalog/items.json").exists()
-    assert any("removed catalog/items.json" in w for w in report["warnings"])
+    assert report["removed"] == ["catalog/items.json"]
+
+
+def test_only_some_sections_from_another_instance_removes_the_rest(tmp_path):
+    # --only schema into another instance's snapshot must not leave its roles and properties behind.
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": "https://lab.service-now.com"}))
+    (tmp_path / "schema/relationships.json").write_text("{}")  # a Node-only file
+    report, _ = run(tmp_path, only=["schema"])
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.json")) == [
+        "instance.json", "schema/choices.json", "schema/columns.json", "schema/relationships.json",
+        "schema/tables.json"]
+    assert any("schema/relationships.json is from https://lab" in w for w in report["warnings"])
+    assert load(tmp_path, "instance.json")["instance_url"] == "https://corp.service-now.com"
 
 
 def test_a_skipped_sections_file_from_the_same_instance_is_kept(tmp_path):
@@ -252,7 +359,19 @@ def test_a_skipped_sections_file_from_the_same_instance_is_kept(tmp_path):
     bad = Resp(403, {"error": {"message": "no"}})
     report, _ = run(tmp_path, Instance(fail={"sc_cat_item": (0, bad)}))
     assert (tmp_path / "catalog/items.json").exists()
-    assert not any("removed" in w for w in report["warnings"])
+    assert report["removed"] == []
+
+
+def test_instance_json_names_the_release_and_files_carry_their_schema(tmp_path):
+    run(tmp_path)
+    info = load(tmp_path, "instance.json")
+    assert info["family"] == "brazil" and info["build"] == "glide-brazil-08-25-2026__patch0-08-26-2026"
+    assert info["build_date"] == "09-22-2026_1636"
+    assert info["$schema"] == "./schemas/instance.schema.json" and info["profile"] == "exported"
+    assert load(tmp_path, "catalog/items.json")["$schema"] == "../schemas/catalog-items.schema.json"
+    assert list(load(tmp_path, "schema/tables.json")["tables"]) == ["incident", "task"]  # sorted by name
+    assert [c["element"] for c in load(tmp_path, "schema/columns.json")["columns"]["task"]] == [
+        "assigned_to", "state"]
 
 
 def test_unknown_section_is_refused(tmp_path):
@@ -266,7 +385,7 @@ def test_cli_reports_and_exits_nonzero_on_failure(tmp_path, monkeypatch, capsys)
     assert "wrote schema/tables.json (2 entries)" in capsys.readouterr().out
     monkeypatch.setattr(export, "get_client", lambda: Client(Instance({**TABLES, "sys_db_object": []})))
     assert export.main(["--out", str(tmp_path)]) == 1
-    assert "export failed: sys_db_object: 0 rows" in capsys.readouterr().err
+    assert "export failed: sys_db_object: 0 of 0 rows" in capsys.readouterr().err
 
 
 # --- redaction: the cases from servicenow-coder's redact.test.js -----------------------
@@ -285,6 +404,8 @@ def test_cli_reports_and_exits_nonzero_on_failure(tmp_path, monkeypatch, capsys)
     ("x_app.api_key", "aB3dEfGhIjKlMnOpQrSt1234567890\n", None),
     ("x_app.api_key", "  aB3d:EfGhIjKlMnOpQrSt12345  ", None),
     ("some_random_prop", " AIzaSyD-fakeGoogleApiKeyLookingValue123", None),
+    ("some_random_prop", "﻿ghp_fakeGithubToken", None),          # JS trim() strips a BOM
+    ("x_app.api_key", "abcdefghijklmnopq", None),                 #  isn't JS whitespace
 ] + [("x_app.some_cert_blob", f"-----BEGIN {h}-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END {h}-----\n", "string")
      for h in ("PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY")])
 def test_redacted(name, value, type_):
