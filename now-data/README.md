@@ -95,3 +95,34 @@ verbs.now_query("incident", "active=true^priority=1", fields="number,short_descr
 preview = verbs.now_update("incident", sys_id, {"state": "2"})          # writes nothing
 verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # writes
 ```
+
+## Exporting a snapshot for now-config
+
+now-config answers from an instance-config snapshot. This writes one from the instance in `SN_INSTANCE`, with nothing but this package. You don't need Node or servicenow-coder's exporter.
+
+```bat
+now-mcp-export --out C:\snapshots\my-instance          # or: python -m now_data.export --out ...
+set INSTANCE_CONFIG_ROOT=C:\snapshots\my-instance      # then now-config reads it
+```
+
+```python
+from now_data.export import export_snapshot
+report = export_snapshot(r"C:\snapshots\my-instance")   # {written, skipped, warnings, ...}
+```
+
+- **What it writes.** It writes the files now-config reads, in the same shapes as servicenow-coder's `export-instance.js`:
+  - `schema/` (tables, columns, choices);
+  - `platform/` (properties, scopes);
+  - `security/roles.json`;
+  - `catalog/items.json`;
+  - `instance.json`.
+
+  `--only schema,platform,security,catalog` picks sections.
+- **Schema is required.** If any schema table can't be read completely, or returns 0 rows, the export fails and writes nothing for that section, because an empty schema would say "doesn't exist" to everything. The other sections are best-effort: a failure skips the section and says why.
+- **Every page is checked.** PySNC's own paging raises only on a 401, so a 403, a 5xx or the wake page partway through would end with a short file and no error. This pages the Table API itself, by `sys_id`, and fails on any bad page.
+- **Rows hidden by ACLs are reported, not ignored.** For example, `sys_dictionary: read 170427 of 170762 rows`. Even an admin-level user sees this on a PDI. A snapshot can't answer about rows its user can't read.
+- **Secrets.** Property values are redacted to `[REDACTED]` by the same three rules as servicenow-coder's `redact.js`: a password type, a credential prefix or PEM key, or a secret-looking name with an opaque value.
+- **Re-exporting.** Files are replaced atomically. If a section is skipped, an earlier file for it is kept when it came from the same instance, and deleted when it came from another.
+- **Time.** On a PDI (170k dictionary rows) the full export took 7 min 49 s, nearly all of it `sys_dictionary`. A production instance's dictionary is usually larger.
+
+A snapshot belongs to its instance: choice values differ between instances, so export from the one you'll ask about.

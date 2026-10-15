@@ -37,6 +37,8 @@ pip install "now-mcp-config[server] @ git+https://github.com/orwellsanimal/now-m
 
 The snapshot is **per instance**: choice values and custom fields drift between instances, so ground against the instance you're targeting. The file layout is in [`tests/fixtures/instance-config/`](../tests/fixtures/instance-config/).
 
+To make one without Node, use now-data's exporter, `now-mcp-export --out DIR` ([details](../now-data/README.md#exporting-a-snapshot-for-now-config)), then point `INSTANCE_CONFIG_ROOT` at `DIR`.
+
 ## As a library
 
 ```python
