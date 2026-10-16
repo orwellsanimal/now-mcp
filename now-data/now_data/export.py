@@ -355,10 +355,14 @@ def _same_instance(a: str | None, b: str) -> bool:
 
 
 def _previous_instance(out: Path) -> str | None:
+    """The instance_url of an earlier export in `out`, or None. Anything but a non-empty string
+    (a hand-edited 123, a list) is None, which counts as another instance: the side the
+    cleanup already errs toward."""
     try:
-        return json.loads((out / "instance.json").read_text(encoding="utf-8")).get("instance_url")
+        url = json.loads((out / "instance.json").read_text(encoding="utf-8")).get("instance_url")
     except (OSError, ValueError, AttributeError):
         return None
+    return url if isinstance(url, str) and url.strip() else None
 
 
 def _version() -> str:
@@ -403,15 +407,16 @@ def export_snapshot(
 
     `only` picks sections (default: all of schema, platform, security, catalog). The
     schema section is the one now-config can't work without, so an error there, or a
-    schema table with no readable rows, raises ExportError. An error in any other
-    section skips that section and is reported.
+    schema table with no readable rows, raises ExportError. Every other table stands
+    alone: an error, or rows that exist but none readable, skips that table's file
+    (reported in `skipped`, an earlier file kept) and the rest of its section is written.
 
     Everything is read before anything is written, so a failed export leaves `out_dir`
-    as it was. If `out_dir` held an export of a different instance, every file of a
-    section this run didn't write is removed: a missing file errors clearly, a file
+    as it was. If `out_dir` held an export of a different instance, every snapshot file
+    this run didn't write is removed: a missing file errors clearly, a file
     from the wrong instance answers wrongly. Files of the same instance are kept.
 
-    Returns {instance, out_dir, written: {path: entries}, skipped: {section: reason},
+    Returns {instance, out_dir, written: {path: entries}, skipped: {path: reason},
     removed: [...], warnings: [...]}.
     """
     sections = list(SECTIONS) if only is None else [s.strip() for s in only if s.strip()]
@@ -425,39 +430,44 @@ def export_snapshot(
     report: dict[str, Any] = {"instance": instance, "out_dir": str(out), "written": {}, "skipped": {},
                               "removed": [], "warnings": []}
 
-    # 1. Read everything.
+    # 1. Read everything. The schema is all or nothing: its three files only make sense together.
+    # Every other table stands alone, so a login that can't read sys_properties still gets
+    # scopes.json; its skip is reported by file.
     docs: dict[str, dict] = {}
     for section in sections:
         section_docs: dict[str, dict] = {}
-        try:
-            for table, query, fields, build in PLAN[section]:
-                log(f"  {table}...")
+        for table, query, fields, build in PLAN[section]:
+            log(f"  {table}...")
+            try:
                 rows, total = fetch_all(client, table, query, fields, display=table in DISPLAY_TABLES)
-                if not rows:
-                    if section == REQUIRED:  # an empty schema would answer "doesn't exist" to everything
-                        raise ExportError(f"{table}: 0 of {total} rows readable. The user needs read access to it.")
-                    if total:  # rows exist but none is readable: skip, so a good earlier file isn't emptied
-                        raise ExportError(f"{table}: 0 of {total} rows readable; read ACLs hide them all.")
-                    report["warnings"].append(f"{table}: 0 rows; the table is empty.")
-                elif len(rows) < total:
-                    report["warnings"].append(
-                        f"{table}: read {len(rows)} of {total} rows; read ACLs hid the rest, so the snapshot "
-                        "will not know about them."
-                    )
-                section_docs.update(build(rows))
-        except ExportError as e:
-            if section == REQUIRED:
-                raise
-            report["skipped"][section] = str(e)
-            continue
+                if not rows and total:  # rows exist, none readable: never write an empty file over a good one
+                    raise ExportError(f"{table}: 0 of {total} rows readable; read ACLs hide them all.")
+                if not rows and section == REQUIRED:  # an empty schema would say "doesn't exist" to everything
+                    raise ExportError(f"{table}: 0 of 0 rows; the schema can't be empty.")
+            except ExportError as e:
+                if section == REQUIRED:
+                    raise
+                for rel in build([]):
+                    report["skipped"][rel] = str(e)
+                continue
+            if not rows:
+                report["warnings"].append(f"{table}: 0 rows; the table is empty.")
+            elif len(rows) < total:
+                report["warnings"].append(
+                    f"{table}: read {len(rows)} of {total} rows; read ACLs hid the rest, so the snapshot "
+                    "will not know about them."
+                )
+            section_docs.update(build(rows))
         docs.update(section_docs)
     if not docs:
         return report
     info = _instance_info(client, instance)
+    # Decided before anything is written, so nothing about it can fail half-way through the writes.
+    previous = _previous_instance(out)
+    same = _same_instance(previous, instance)
 
     # 2. Write. instance.json goes first and comes back last, so a write that dies part-way
     # leaves no file claiming the directory is one instance's snapshot.
-    previous = _previous_instance(out)
     (out / "instance.json").unlink(missing_ok=True)
     exported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for rel, doc in docs.items():
@@ -465,7 +475,7 @@ def export_snapshot(
         _write_json(out / rel, doc)
         key = next(k for k in doc if not k.startswith("_") and k != "$schema")
         report["written"][rel] = len(doc[key])
-    if not _same_instance(previous, instance):
+    if not same:
         for section in SECTIONS:
             for rel in _section_files(section):
                 if rel not in docs and (out / rel).exists():
@@ -500,8 +510,8 @@ def main(argv: list[str] | None = None) -> int:
     if not report["written"]:
         # Nothing on disk: a caller (rio) must not read this as a snapshot made (now-mcp#16).
         print(f"export failed: nothing exported from {report['instance']}", file=sys.stderr)
-        for section, reason in report["skipped"].items():
-            print(f"  SKIPPED {section}: {reason}", file=sys.stderr)
+        for rel, reason in report["skipped"].items():
+            print(f"  SKIPPED {rel}: {reason}", file=sys.stderr)
         for w in report["warnings"]:
             print(f"  warning: {w}", file=sys.stderr)
         return 1
@@ -510,8 +520,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  wrote {rel} ({n} entries)")
     for rel in report["removed"]:
         print(f"  removed {rel}: it was from another instance")
-    for section, reason in report["skipped"].items():
-        print(f"  SKIPPED {section}: {reason}")
+    for rel, reason in report["skipped"].items():
+        print(f"  SKIPPED {rel}: {reason}")
     for w in report["warnings"]:
         print(f"  warning: {w}")
     return 0
