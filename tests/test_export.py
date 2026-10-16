@@ -322,7 +322,8 @@ def test_an_optional_section_is_skipped_and_the_rest_written(tmp_path):
     bad = Resp(403, {"error": {"message": "User Not Authorized"}}, reason="Forbidden")
     report, _ = run(tmp_path, Instance(fail={"sc_cat_item": (0, bad)}))
     assert "catalog/items.json" not in report["written"]
-    assert "HTTP 403" in report["skipped"]["catalog"] and "User Not Authorized" in report["skipped"]["catalog"]
+    reason = report["skipped"]["catalog/items.json"]
+    assert "HTTP 403" in reason and "User Not Authorized" in reason
     assert (tmp_path / "schema/tables.json").exists()
 
 
@@ -388,6 +389,50 @@ def test_cli_reports_and_exits_nonzero_on_failure(tmp_path, monkeypatch, capsys)
     assert "export failed: sys_db_object: 0 of 0 rows" in capsys.readouterr().err
 
 
+FORBIDDEN = Resp(403, {"error": {"message": "User Not Authorized"}}, reason="Forbidden")
+
+
+def test_cli_fails_when_nothing_was_written(tmp_path, monkeypatch, capsys):
+    # now-mcp#16: every chosen section skipped -> no files, so not a success.
+    refused = {"sys_properties": (0, FORBIDDEN), "sys_scope": (0, FORBIDDEN)}
+    monkeypatch.setattr(export, "get_client", lambda: Client(Instance(fail=refused)))
+    assert export.main(["--out", str(tmp_path), "--only", "platform"]) == 1
+    out, err = capsys.readouterr()
+    assert "Exported" not in out
+    assert "nothing exported from https://corp.service-now.com" in err and "SKIPPED platform/properties.json" in err and "SKIPPED platform/scopes.json" in err
+    assert not any(tmp_path.iterdir())
+
+
+def test_cli_succeeds_when_only_optional_sections_are_skipped(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(export, "get_client", lambda: Client(Instance(fail={"sc_cat_item": (0, FORBIDDEN)})))
+    assert export.main(["--out", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Exported" in out and "SKIPPED catalog/items.json" in out
+
+
+@pytest.mark.parametrize("previous", [
+    "https://corp.service-now.com/", "https://CORP.service-now.com", "corp", "corp.service-now.com",
+    "https://corp.service-now.com/now/nav/ui/home", "https://corp.service-now.com:443",
+    "http://corp.service-now.com", "https://corp.service-now.com.",
+])
+def test_the_same_instance_written_differently_keeps_its_files(tmp_path, previous):
+    # now-mcp#16: a raw string compare called these "another instance" and deleted 4 sections' files.
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": previous}))
+    report, _ = run(tmp_path, only=["schema"])
+    assert report["removed"] == []
+    assert (tmp_path / "platform/properties.json").exists() and (tmp_path / "catalog/items.json").exists()
+
+
+@pytest.mark.parametrize("previous", ["https://lab.service-now.com", "not a url at all ::", ""])
+def test_another_or_unreadable_instance_still_counts_as_another(tmp_path, previous):
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": previous}))
+    report, _ = run(tmp_path, only=["schema"])
+    assert sorted(report["removed"]) == ["catalog/items.json", "platform/properties.json",
+                                         "platform/scopes.json", "security/roles.json"]
+
+
 # --- redaction: the cases from servicenow-coder's redact.test.js -----------------------
 
 @pytest.mark.parametrize("name,value,type_", [
@@ -423,3 +468,49 @@ def test_redacted(name, value, type_):
 ])
 def test_kept(name, value, type_):
     assert redact_secret_value(name, value, type_) == value
+
+
+def test_an_optional_section_with_every_row_hidden_is_skipped_not_emptied(tmp_path):
+    # #17 review: a 0-readable optional table wrote {} over a good file and exited 0.
+    run(tmp_path)
+    report, _ = run(tmp_path, Instance(hidden={"sc_cat_item": {"c1"}}), only=["catalog"])
+    assert report["written"] == {} and "0 of 1 rows readable" in report["skipped"]["catalog/items.json"]
+    assert load(tmp_path, "catalog/items.json")["items"] != {}  # the earlier file is kept
+
+
+def test_an_optional_table_that_is_really_empty_is_written_empty(tmp_path):
+    report, _ = run(tmp_path, Instance({**TABLES, "sc_cat_item": []}), only=["schema", "catalog"])
+    assert report["written"]["catalog/items.json"] == 0
+    assert any("sc_cat_item: 0 rows; the table is empty" in w for w in report["warnings"])
+
+
+def test_a_hidden_table_skips_only_its_own_file(tmp_path):
+    # #17 review: a login that reads sys_scope but no sys_properties row still gets scopes.json.
+    hidden = {"sys_properties": {"p1", "p2", "p3"}}
+    report, _ = run(tmp_path, Instance(hidden=hidden), only=["platform"])
+    assert report["written"] == {"platform/scopes.json": 2}
+    assert list(report["skipped"]) == ["platform/properties.json"]
+    assert "0 of 3 rows readable" in report["skipped"]["platform/properties.json"]
+
+
+def test_a_refused_table_skips_only_its_own_file(tmp_path):
+    report, _ = run(tmp_path, Instance(fail={"sys_scope": (0, FORBIDDEN)}), only=["platform"])
+    assert report["written"] == {"platform/properties.json": 3}
+    assert list(report["skipped"]) == ["platform/scopes.json"]
+
+
+def test_a_schema_table_failure_still_fails_the_whole_schema(tmp_path):
+    with pytest.raises(export.ExportError, match="sys_choice"):
+        run(tmp_path, Instance(fail={"sys_choice": (0, FORBIDDEN)}))
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("junk", [123, ["https://corp.service-now.com"], {"url": "x"}, None, "  "])
+def test_a_previous_instance_url_that_is_not_a_string_counts_as_another_instance(tmp_path, junk):
+    # #17 review: 123 reached .strip() after the schema was written and ended in a traceback.
+    run(tmp_path)
+    (tmp_path / "instance.json").write_text(json.dumps({"instance_url": junk}))
+    report, _ = run(tmp_path, only=["schema"])
+    assert sorted(report["removed"]) == ["catalog/items.json", "platform/properties.json",
+                                         "platform/scopes.json", "security/roles.json"]
+    assert load(tmp_path, "instance.json")["instance_url"] == "https://corp.service-now.com"
