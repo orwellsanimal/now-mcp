@@ -211,13 +211,27 @@ def test_update_with_an_unknown_field_is_not_updated(client):
     assert client.db["incident"]["id1"]["state"] == "2" and "bogus" not in client.db["incident"]["id1"]
 
 
-@pytest.mark.parametrize("values", [{"u_typo": "n"}, {"work_note": "Called the user"}, {}],
-                         ids=["typo", "work_note", "empty"])
-def test_a_confirmed_update_with_no_field_on_the_record_writes_nothing(client, values):
-    with pytest.raises(query_check.QueryRefused, match="nothing was written"):
+@pytest.mark.parametrize("values, message", [
+    ({"u_typo": "n"}, "nothing was written: incident record id1 has no field u_typo as this account reads it"),
+    ({"work_note": "Called the user"}, "nothing was written: incident record id1 has no field work_note "),
+    ({}, "nothing was written: no values were given"),
+], ids=["typo", "work_note", "empty"])
+def test_a_confirmed_update_with_no_field_on_the_record_writes_nothing(client, values, message):
+    with pytest.raises(query_check.QueryRefused, match=message):
         verbs.now_update("incident", "id1", values, confirmed=True)
     assert client.written is False
     assert verbs.now_update("incident", "id1", values)["unknown_fields"] == sorted(values)  # the preview reports
+
+
+def test_a_column_added_since_the_columns_were_cached_is_not_labelled_unknown(client, monkeypatch):
+    verbs.now_update("incident", "id1", {"state": "2"})  # caches incident's columns
+    monkeypatch.setitem(GENERIC, "u_added", {"type": "string"})  # a column added since; this account can't read it
+    done = verbs.now_update("incident", "id1", {"state": "2", "u_added": "x", "u_typo": "y"}, confirmed=True)
+    assert done["not_applied"] == [
+        {"field": "u_added", "requested": "x", "actual": None, "reason": "unreadable_field"},
+        {"field": "u_typo", "requested": "y", "actual": None, "reason": "unknown_field"},
+    ]
+    assert client.session.meta_reads.count("incident") == 2  # read again once before labelling
 
 
 def test_a_field_hidden_by_a_read_acl_is_unreadable_and_not_sent(client):
@@ -281,36 +295,102 @@ def test_update_that_cannot_be_read_back_raises_and_says_it_was_accepted(client)
 
 # ── now-mcp#18 review: a failure during the write says it may have landed ────
 
-def _maybe_sent():
+def _pysnc_raises(method, status, body=b'{"result": {"sys_id": "id1"}}', content_type="application/json"):
+    """What the installed pysnc raises when the instance answers its PATCH (update) or POST (insert)
+    with `status` and `body`: a real ServiceNowClient over a canned transport, so the exception is
+    built by pysnc's own code (1.2.1 when this was written), not by hand (review, round 2)."""
+    import requests
+    from pysnc import ServiceNowClient
+    from requests.adapters import BaseAdapter
+
+    class Canned(BaseAdapter):
+        def send(self, request, **kwargs):
+            r = requests.Response()
+            r.status_code, r._content, r.encoding = status, body, "utf-8"
+            r.headers["Content-Type"] = content_type
+            r.request, r.url = request, request.url
+            return r
+
+        def close(self):
+            pass
+
+    sn = ServiceNowClient("https://example.service-now.com", ("user", "pw"))
+    sn.session.mount(sn.instance, Canned())  # replaces pysnc's own adapter at that prefix
+    gr = sn.GlideRecord("incident")
+    gr.initialize()
+    if method == "update":
+        gr.set_value("sys_id", "id1")
+    gr.set_value("state", "2")
+    try:
+        getattr(gr, method)()
+    except Exception as e:
+        return e
+    pytest.fail(f"pysnc's {method}() no longer raises for HTTP {status}: re-check verbs._write against it")
+
+
+def _maybe_landed():
+    """Write failures after which the write may have landed: (update's, insert's) exception."""
     import requests
     from pysnc import exceptions as px
+    html = (b"<html>Your instance is hibernating</html>", "text/html")
     return {
-        "reset": requests.ConnectionError("('Connection aborted.', ConnectionResetError(10054))"),
-        "chunked": requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),
-        "pysnc-no-status": px.RequestException({"error": {"message": "Internal Server Error"}}),
-        "update-503": px.UpdateException({"error": {"message": "Service Unavailable"}}, status_code=503),
-        "insert-502": px.InsertException({"error": {"message": "Bad Gateway"}}, status_code=502),
-        "empty-answer": AttributeError("'GlideRecord' object has no attribute 'sys_id'"),
+        # Built by pysnc itself: a status it doesn't take as success, an error status it keeps no
+        # code for, and an answer that isn't JSON.
+        "2xx-not-expected": (_pysnc_raises("update", 202), _pysnc_raises("insert", 200)),
+        "202": (_pysnc_raises("update", 202), _pysnc_raises("insert", 202)),
+        "5xx": (_pysnc_raises("update", 500, b'{"error": {"message": "boom"}}'),
+                _pysnc_raises("insert", 503, b'{"error": {"message": "Service Unavailable"}}')),
+        "400": (_pysnc_raises("update", 400, b'{"error": {"message": "Bad Request"}}'),
+                _pysnc_raises("insert", 400, b'{"error": {"message": "Bad Request"}}')),
+        "empty-204": (_pysnc_raises("update", 204, b""), _pysnc_raises("insert", 204, b"")),
+        "html-200": (_pysnc_raises("update", 200, *html), _pysnc_raises("insert", 201, *html)),
+        # The transport, and what pysnc's GlideRecord raises reading the sys_id of an empty answer.
+        "reset": (requests.ConnectionError("('Connection aborted.', ConnectionResetError(10054))"),) * 2,
+        "chunked": (requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),) * 2,
+        "empty-answer": (AttributeError("'GlideRecord' object has no attribute 'sys_id'"),) * 2,
+        # A pysnc that keeps a 5xx's status, or none.
+        "kept-503": (px.UpdateException({"error": "x"}, status_code=503),
+                     px.InsertException({"error": "x"}, status_code=503)),
+        "no-status": (px.UpdateException({"error": "x"}), px.InsertException({"error": "x"})),
     }
 
 
 def _refused():
+    """Answers that mean the instance refused, so nothing was written: (update's, insert's) exception."""
     from pysnc import exceptions as px
+    error = b'{"error": {"message": "refused"}}'
     return {
-        "401": px.AuthenticationException({"error": {"message": "User Not Authenticated"}}),
-        "403": px.RoleException({"error": {"message": "Operation Failed", "detail": "ACL Exception"}}),
-        "404": px.NotFoundException({"error": {"message": "No Record found"}}),
-        "update-400": px.UpdateException({"error": {"message": "Bad Request"}}, status_code=400),
+        "401": (_pysnc_raises("update", 401, error), _pysnc_raises("insert", 401, error)),
+        "403": (_pysnc_raises("update", 403, error), _pysnc_raises("insert", 403, error)),
+        "404": (_pysnc_raises("update", 404, error), _pysnc_raises("insert", 404, error)),
+        # A pysnc that keeps a 4xx's status on Update/InsertException.
+        "kept-400": (px.UpdateException({"error": "x"}, status_code=400),
+                     px.InsertException({"error": "x"}, status_code=422)),
     }
 
 
-@pytest.mark.parametrize("case", list(_maybe_sent()))
+def test_pysnc_raises_update_and_insert_exceptions_only_for_statuses_below_400():
+    # The premise of _write's 4xx rule (review, round 2): pysnc turns every status of 400 or more into
+    # Auth/Role/NotFound/RequestException before update()/insert() build their own exception.
+    from pysnc import exceptions as px
+    assert isinstance(_pysnc_raises("update", 202), px.UpdateException)
+    assert _pysnc_raises("update", 202).status_code == 202
+    assert isinstance(_pysnc_raises("insert", 200), px.InsertException)
+    for status in (400, 409, 422, 500, 503):
+        e = _pysnc_raises("update", status, b'{"error": {"message": "x"}}')
+        assert type(e) is px.RequestException, (status, type(e))
+    assert type(_pysnc_raises("update", 403, b'{"error": {}}')) is px.RoleException
+
+
+@pytest.mark.parametrize("case", list(_maybe_landed()))
 def test_a_write_that_fails_once_it_may_have_been_sent_is_unconfirmed(client, case):
-    client.write_error = _maybe_sent()[case]
+    on_update, on_insert = _maybe_landed()[case]
+    client.write_error = on_update
     with pytest.raises(verbs.WriteUnconfirmed, match=r"incident id1: the update may have been applied: .*"
                                                      r"Check the record before retrying") as caught:
         verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
-    assert caught.value.__cause__ is client.write_error
+    assert caught.value.__cause__ is on_update
+    client.write_error = on_insert
     with pytest.raises(verbs.WriteUnconfirmed, match=r"incident: the insert may have been applied: .*"
                                                      r"A row may exist"):
         verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
@@ -318,12 +398,74 @@ def test_a_write_that_fails_once_it_may_have_been_sent_is_unconfirmed(client, ca
 
 @pytest.mark.parametrize("case", list(_refused()))
 def test_a_write_the_instance_refused_is_raised_as_it_is(client, case):
-    client.write_error = _refused()[case]
-    with pytest.raises(type(client.write_error)) as caught:
+    on_update, on_insert = _refused()[case]
+    client.write_error = on_update
+    with pytest.raises(type(on_update)) as caught:
         verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
-    assert caught.value is client.write_error and not isinstance(caught.value, verbs.WriteUnconfirmed)
-    with pytest.raises(type(client.write_error)):
+    assert caught.value is on_update and not isinstance(caught.value, verbs.WriteUnconfirmed)
+    client.write_error = on_insert
+    with pytest.raises(type(on_insert)) as caught:
         verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
+    assert caught.value is on_insert
+
+
+def test_an_answer_that_is_not_json_says_so_not_that_the_connection_failed(client):
+    client.write_error = _pysnc_raises("update", 200, b"<html>hibernating</html>", "text/html")
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"answered with something that isn't JSON.*"
+                                                     r"may or may not have landed") as caught:
+        verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
+    assert "connection" not in str(caught.value)
+
+
+def _connect_failures():
+    import requests
+    from urllib3.exceptions import MaxRetryError, NameResolutionError, NewConnectionError
+    refused = NewConnectionError(None, "Failed to establish a new connection: [WinError 10061] refused")
+    dns = NameResolutionError("example.service-now.com", None, OSError("getaddrinfo failed"))
+    return {
+        "refused": requests.ConnectionError(MaxRetryError(None, "/api/now/table/incident", refused)),
+        "dns": requests.ConnectionError(MaxRetryError(None, "/api/now/table/incident", dns)),
+        "connect-timeout": requests.ConnectTimeout("Connection to example.service-now.com timed out"),
+    }
+
+
+@pytest.mark.parametrize("case", list(_connect_failures()))
+def test_a_connection_that_could_not_be_opened_is_worded_not_sent_but_stays_unconfirmed(client, case):
+    # The last attempt never reached the instance, but pysnc retries and keeps only the last reason,
+    # so "safe to retry" is more than the exception can back.
+    client.write_error = _connect_failures()[case]
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident id1: the update was most likely not sent: the "
+                                                     r"connection to the instance could not be opened.*"
+                                                     r"can't be ruled out"):
+        verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident: the insert was most likely not sent"):
+        verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
+
+
+def test_a_connection_reset_after_sending_is_not_worded_not_sent(client):
+    client.write_error = _maybe_landed()["reset"][0]
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"may have been applied: the connection broke after the "
+                                                     r"request may have been sent"):
+        verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
+
+
+# ── now-mcp#18 review, round 2: true/false fields take true or false ─────────
+
+@pytest.mark.parametrize("value", ["1", "0", "yes", "TRUE", "", 1])
+def test_a_true_false_field_given_anything_else_is_refused_before_the_write(client, value):
+    with pytest.raises(query_check.QueryRefused, match=r"active is a true/false field, so give it true or false"):
+        verbs.now_update("incident", "id1", {"active": value}, confirmed=True)
+    with pytest.raises(query_check.QueryRefused, match=r"active is a true/false field"):
+        verbs.now_insert("incident", {"active": value}, confirmed=True)
+    assert client.written is False and client.records == []
+
+
+@pytest.mark.parametrize("value", [True, False, "true", "false", " true "])
+def test_a_true_false_field_takes_true_or_false(client, value):
+    client.db["incident"]["id1"]["active"] = "false" if value in (True, "true", " true ") else "true"
+    client.coerce = {"active": lambda v: str(v).strip().lower()}  # the instance stores JSON true as "true"
+    done = verbs.now_update("incident", "id1", {"active": value}, confirmed=True)
+    assert done["action"] == "updated" and done["changed_fields"] == ["active"]
 
 
 # ── journal fields ───────────────────────────────────────────────────────────

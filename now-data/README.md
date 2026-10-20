@@ -40,6 +40,7 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 - an operator ServiceNow doesn't apply (`state~1`, a bare field);
 - text operators on a number-stored choice;
 - a repeated operator (`active==true`);
+- a true/false field written with anything but `true` or `false` (`"1"`, `"yes"`, `"TRUE"`), in `now_update` and `now_insert` values, since what the platform stores for those hasn't been measured;
 - related-list conditions (`RLQUERY`), which aren't checked.
 
 If the fields can't be read, the verb raises `FieldsUnreadable` (a `RuntimeError`) and runs nothing, so it fails closed.
@@ -63,18 +64,18 @@ What counts as equal:
 - Surrounding whitespace.
 - On a number column (UI Meta `internal_type` integer, longint, decimal or float), the same number written differently: `state="02"` stored as `2`.
 
-Known limits: give a reference field a sys_id, because a display name that the instance resolves reads back as a sys_id and is reported as not applied. A boolean given `"1"` is compared as text, since what the platform stores for it hasn't been measured.
+Known limit: give a reference field a sys_id, because a display name that the instance resolves reads back as a sys_id and is reported as not applied. (A true/false field takes only `true` or `false`; anything else is refused before the write.)
 
 - **`now_update`** returns `{confirmed, action, table, sys_id, changed_fields, not_applied, journal_unconfirmed, no_ops, unknown_fields}`, plus a `note` when `not_applied` or `journal_unconfirmed` isn't empty.
   - `changed_fields` lists the changes that **landed**.
   - `not_applied` lists `{field, requested, actual, reason}` for everything asked for that the record doesn't hold. `reason` is one of:
     - `"value_differs"`: written, but the record holds `actual`.
-    - `"unknown_field"`: not a field of the table, so it wasn't sent.
-    - `"unreadable_field"`: a field of the table that isn't on the record as this account reads it (a field ACL), so it wasn't sent.
+    - `"unknown_field"`: missing from the record as this account reads it, and not a column in the table's UI Meta columns either (read again once before labelling), so it wasn't sent.
+    - `"unreadable_field"`: missing from the record as this account reads it, but a column in UI Meta, so most likely hidden by a field ACL. It wasn't sent.
 
     The unsent fields are in `unknown_fields` too, with `actual: null`. A confirmed update in which **no** field is on the record (a misspelt `work_note`, say) is refused with `QueryRefused` and writes nothing.
   - `action` is `"updated"` only when `not_applied` is empty. Otherwise it's `"partially_applied"` when something landed or may have, and `"not_applied"` when nothing did.
-  - Journal fields (type `journal_input` or `journal`, e.g. `work_notes`, `comments`) read back empty, so each is confirmed by a **new** `sys_journal_field` entry with its text instead. The type comes from the UI Meta columns: on a PDI on 2026-10-19, incident's `work_notes` and `comments` read `internal_type` and `type` `journal_input` (`tests/fixtures/ui_meta/incident.json`). The entries that already match are read before the write, so an identical older note doesn't count. A journal field that can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note may have landed, and a retry would duplicate it.
+  - Journal fields (type `journal_input` or `journal`, e.g. `work_notes`, `comments`) read back empty, so each is confirmed by a **new** `sys_journal_field` entry with its text instead. The type comes from the UI Meta columns: on a PDI on 2026-10-19, incident's `work_notes` and `comments` read `internal_type` and `type` `journal_input` (`tests/fixtures/ui_meta/incident.json`). A Table API `get()` of an incident on the same PDI that day returned both keys with the value `""` to an account that can read them, so they are fields of the record as read and read back empty. The entries that already match are read before the write, so an identical older note doesn't count. A journal field that can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note may have landed, and a retry would duplicate it.
     - If reading the journal before the write fails with an HTTP error (pysnc raises on a 403), the update raises and writes nothing.
     - A read ACL that filters the rows answers 200 with none, so the update goes ahead and the note comes back in `journal_unconfirmed`.
   - **`"updated"` means nothing was kept back, not that everything was confirmed.** It can come with a non-empty `journal_unconfirmed`, so read `journal_unconfirmed` whatever the `action`.
@@ -83,7 +84,10 @@ Known limits: give a reference field a sys_id, because a display name that the i
   - Journal fields aren't confirmed through the journal on insert, so a work note given to `now_insert` is listed as a difference. Use `now_update` to add one.
 
 **A write that can't be confirmed raises `now_data.verbs.WriteUnconfirmed`** (a `RuntimeError`). It's raised once the write may have reached the instance:
-- the connection failed after the request may have been sent, or the instance answered with an error status that pysnc 1.2.1 doesn't keep (pysnc raises a bare `RequestException` for a 400 and a 5xx alike, so both are treated as "may have landed");
+- the instance answered with an error status that pysnc 1.2.1 doesn't keep (it raises a bare `RequestException` for a 400 and a 5xx alike, so both are treated as "may have landed");
+- the instance answered with a status pysnc doesn't take as success: a PATCH answered 202, or a POST answered 200 or 202 (pysnc's `UpdateException` / `InsertException`). Only a 4xx carried by those counts as refused;
+- the answer wasn't JSON (a hibernating instance's HTML page, an empty 204);
+- the connection broke after the request may have been sent. A connection that couldn't be opened at all is worded "most likely not sent", but it's still unconfirmed: pysnc retries a failed attempt, and an earlier one that reached the instance can't be ruled out;
 - the answer had no sys_id (for an insert, a read ACL can hide it from the answer);
 - the record can't be read back. For an insert, the message names the new sys_id.
 

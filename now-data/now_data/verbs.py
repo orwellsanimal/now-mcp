@@ -159,9 +159,11 @@ def now_aggregate(
 # journal_input in sys_dictionary). Told apart by the UI Meta column type that
 # query_check already reads, not by name, so a custom journal field counts too.
 #
-# Measured on a PDI's UI Meta API (2026-10-19, now-mcp#18 review): incident's
-# work_notes and comments have internal_type and type "journal_input"
-# (tests/fixtures/ui_meta/incident.json).
+# Measured on a PDI (2026-10-19, now-mcp#18 review): incident's UI Meta columns give
+# work_notes and comments internal_type and type "journal_input"
+# (tests/fixtures/ui_meta/incident.json), and a Table API get() of an incident gives
+# both keys with the value "" to an account that can read them, so they are known
+# fields of the record and read back empty.
 _JOURNAL_TYPES = {"journal", "journal_input"}
 
 # Column types whose stored value is a number: "02" given to state (integer) is
@@ -188,28 +190,51 @@ def _write(call: Callable[[], Any], what: str, advice: str) -> Any:
     pysnc 1.2.1 (client._validate_response) turns an HTTP 401 / 403 / 404 into
     AuthenticationException / RoleException / NotFoundException: the instance
     answered and refused, so nothing was written. Those aren't caught here and
-    propagate as pysnc raised them. Every other error status, a 400 and a 5xx
-    alike, becomes a bare RequestException without the status, and a connection
-    dropped after the request went out is a requests exception: either way the
-    write may have landed. Insert/UpdateException carry their status, so only a
-    5xx of theirs counts. An answer with an empty result makes pysnc raise
-    AttributeError reading its sys_id (now-mcp#18 review).
+    propagate as pysnc raised them. Every other status of 400 or more, a 400 and a
+    5xx alike, becomes a bare RequestException without the status: it may have
+    landed. Update/InsertException are built only AFTER that check, so in 1.2.1
+    they carry a status it let through: a 1xx/2xx/3xx other than the 200 / 201
+    update() / insert() expect, e.g. a PATCH answered 202 or a POST answered 200.
+    Such a write may well have landed, so only a 4xx (a pysnc that keeps the
+    status) counts as refused (now-mcp#18 review, round 2).
+
+    A connection that breaks is a requests exception. A connect failure (urllib3's
+    ConnectTimeoutError, which covers NewConnectionError and DNS) means the last
+    attempt was never sent, but pysnc mounts Retry(total=4) and MaxRetryError keeps
+    only the last reason, so an earlier attempt that reached the instance can't be
+    ruled out: it is still unconfirmed, only worded as "most likely not sent". A
+    non-JSON answer (a hibernating instance's HTML page, an empty 204) is a
+    JSONDecodeError. An answer with an empty result makes pysnc raise
+    AttributeError reading its sys_id.
     """
     import requests  # PySNC's dependencies, imported here so verbs loads without them
     from pysnc import exceptions as px
+    from urllib3.exceptions import ConnectTimeoutError
 
     try:
         return call()
     except px.RestException as e:
-        if e.status_code is not None and e.status_code < 500:
+        if e.status_code is not None and 400 <= e.status_code < 500:
             raise
         # RestException puts itself in its own args; the last one is "<status> - <body>".
-        cause, why = e, f"the instance answered HTTP {e.status_code} ({e.args[-1] if e.args else e})"
+        cause, why = e, (f"the instance answered HTTP {e.status_code}, which pysnc doesn't take as "
+                         f"success ({e.args[-1] if e.args else e})")
     except px.RequestException as e:
         cause, why = e, (f"the instance answered with an error, and pysnc doesn't say whether "
                          f"it was a 4xx (refused) or a 5xx ({e})")
+    except requests.exceptions.JSONDecodeError as e:  # before RequestException: it is one
+        cause, why = e, (f"the instance answered with something that isn't JSON ({e}): a hibernating "
+                         "instance answers with an HTML page, and a 204 with nothing, so the write may "
+                         "or may not have landed")
     except requests.RequestException as e:
-        cause, why = e, f"the connection failed after the request may have been sent ({type(e).__name__}: {e})"
+        reason = getattr(e.args[0], "reason", None) if e.args else None
+        if isinstance(e, requests.ConnectTimeout) or isinstance(reason, ConnectTimeoutError):
+            raise WriteUnconfirmed(
+                f"{what} was most likely not sent: the connection to the instance could not be "
+                f"opened ({type(e).__name__}: {e}). pysnc retries a failed attempt, so an earlier "
+                f"one that reached the instance can't be ruled out. {advice}"
+            ) from e
+        cause, why = e, f"the connection broke after the request may have been sent ({type(e).__name__}: {e})"
     except AttributeError as e:
         cause, why = e, f"the answer had no sys_id ({e})"
     raise WriteUnconfirmed(f"{what} may have been applied: {why}. {advice}") from cause
@@ -335,11 +360,12 @@ def now_update(
     compared with what was sent. `changed_fields` lists the changes that landed.
     `not_applied` lists `{field, requested, actual, reason}` for everything asked
     for that the record doesn't hold: `reason` is `"value_differs"` (written, but
-    the record holds `actual`), `"unknown_field"` (not a field of the table, so
-    not sent) or `"unreadable_field"` (a field of the table that isn't on the
-    record as this account reads it, so not sent). `unknown_fields` still lists
-    the unsent ones too. A confirmed update in which no field is on the record
-    is refused with QueryRefused and writes nothing.
+    the record holds `actual`), or, for a field missing from the record as this
+    account reads it, so not sent: `"unknown_field"` (not a column in the table's
+    UI Meta columns, read again once before labelling) or `"unreadable_field"` (a
+    column there, so most likely hidden by a field ACL). `unknown_fields` still
+    lists the unsent ones too. A confirmed update in which no field is on the
+    record is refused with QueryRefused and writes nothing.
 
     `action` is `"updated"` only when `not_applied` is empty, else
     `"partially_applied"` (something landed, or may have) or `"not_applied"`.
@@ -353,8 +379,9 @@ def now_update(
     or `journal_unconfirmed` when either isn't empty.
 
     Raises `WriteUnconfirmed` (a RuntimeError) when the write may have reached
-    the instance but can't be confirmed: the connection failed or the instance
-    answered with an error pysnc gives no status for, `update()` didn't return the
+    the instance but can't be confirmed: the connection failed, the instance
+    answered with an error pysnc gives no status for, a status pysnc doesn't take
+    as success (a 202) or something that isn't JSON, `update()` didn't return the
     record's sys_id, or the record can't be read back. Check the record before
     retrying. A 401 / 403 / 404 answer is raised as pysnc raised it: refused,
     nothing written.
@@ -396,8 +423,14 @@ def now_update(
 
     # A field missing from the record as read is a misspelling, or one this account
     # can't read (a field ACL): either way it isn't sent. With nothing left to send,
-    # "updated" would report a write that never happened (now-mcp#18 review).
-    unsent = {f: "unreadable_field" if f in columns else "unknown_field" for f in unknown}
+    # "updated" would report a write that never happened (now-mcp#18 review). Which of
+    # the two it is is told from the UI Meta columns, re-read once first, so a column
+    # added since they were cached isn't labelled unknown (review, round 2).
+    unsent = {}
+    if unknown:
+        not_columns = set(unknown_fields(client, table, unknown))
+        columns = table_columns(client, table)  # the fresh read, if there was one
+        unsent = {f: "unknown_field" if f in not_columns else "unreadable_field" for f in unknown}
     if not known:
         if not unknown:
             raise QueryRefused("nothing was written: no values were given.")
@@ -526,10 +559,11 @@ def now_insert(
     empty and show as differences): add a work note with `now_update`.
 
     Raises `WriteUnconfirmed` (a RuntimeError) once a row may exist: the
-    connection failed or the instance answered with an error pysnc gives no status
-    for, the answer had no sys_id (a read ACL can hide it), or the new row can't be
-    read back, the last naming its sys_id. Don't retry the insert without checking
-    the table: a second insert is a second row. A 401 / 403 / 404 answer is raised
+    connection failed, the instance answered with an error pysnc gives no status
+    for, a status pysnc doesn't take as success (a POST answered 200 or 202) or
+    something that isn't JSON, the answer had no sys_id (a read ACL can hide it),
+    or the new row can't be read back, the last naming its sys_id. Don't retry the
+    insert without checking the table: a second insert is a second row. A 401 / 403 / 404 answer is raised
     as pysnc raised it: refused, nothing inserted.
     """
     client = get_client()

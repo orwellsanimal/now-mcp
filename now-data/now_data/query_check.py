@@ -237,9 +237,23 @@ def _problems(client: Any, table: str, query: str, fields: dict[str, list[str]],
         column = columns.get(name)
         if column is not None and value is not None:
             problem = _value_problem(name, column, "=", str(value), write=True)
+            if not problem and column.get("internal_type") == "boolean":
+                problem = _boolean_problem(name, value)
             if problem:
                 problems.append(f"values: {problem}")
     return problems
+
+
+def _boolean_problem(field: str, value: Any) -> str:
+    """Problem with writing `value` to a boolean field, else "".
+
+    Only true / false are taken. What the platform stores for "1", "yes" or "TRUE"
+    hasn't been measured, and the write's read-back would compare such a value as
+    text, so it is refused with the fix rather than sent (now-mcp#18 review).
+    """
+    if isinstance(value, bool) or str(value).strip() in ("true", "false"):
+        return ""
+    return f"{field} is a true/false field, so give it true or false, not {value!r}"
 
 
 def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]] | None = None,
