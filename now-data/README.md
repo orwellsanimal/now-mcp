@@ -15,7 +15,8 @@ Usable two ways:
 | `now_query(table, query="", fields="", limit=50, display_value=False)` | Returns `{count, truncated, records}`. `limit` is capped at 1000 and `truncated` is set without a second count call |
 | `now_get(table, sys_id, fields="", display_value=False)` | Raises `ValueError` on a missing sys_id |
 | `now_aggregate(table, query="", group_by="", count=True, sum_fields="", …)` | COUNT/SUM/AVG/MIN/MAX via the Stats API (see below) |
-| `now_update(table, sys_id, values, confirmed=False)` | **Dry run by default**: returns `changes` / `no_ops` / `unknown_fields` and writes nothing. Writes only with `confirmed=True`. Unknown fields are never written, because ServiceNow silently ignores writes to non-existent columns |
+| `now_update(table, sys_id, values, confirmed=False)` | **Dry run by default**: returns `changes` / `no_ops` / `unknown_fields` and writes nothing. Writes only with `confirmed=True`, then **reads back** (see below). Unknown fields are never written, because ServiceNow silently ignores writes to non-existent columns |
+| `now_insert(table, values, confirmed=False)` | **Dry run by default**: returns `values` / `unknown_fields` and inserts nothing. `confirmed=True` inserts one row, reads it back and returns its `sys_id`. A confirmed insert with an unknown field is refused |
 | `now_run_script(script, confirmed=False)` | **Gated** server-side JavaScript. The default echoes the script back. `confirmed=True` needs the instance-side endpoint described below |
 
 ## Install
@@ -31,11 +32,11 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 
 **Counting.** `now_query`'s `count` is the number of records *returned*, capped by `limit`. Use `now_aggregate` for a total.
 
-**Requests are checked before they run.** ServiceNow silently drops an encoded-query term it can't apply and answers as if the term weren't there: `nonsense_field=xyz` matches every row, and `state=new` matches none because `state` stores `1`. So `now_query`, `now_get`, `now_aggregate` and `now_update` check each request against the table's fields and choice lists, read once per table from the UI Meta API (`/api/now/ui/meta/<table>`). They raise `now_data.query_check.QueryRefused`, a `ValueError` whose message carries the fix, for:
+**Requests are checked before they run.** ServiceNow silently drops an encoded-query term it can't apply and answers as if the term weren't there: `nonsense_field=xyz` matches every row, and `state=new` matches none because `state` stores `1`. So `now_query`, `now_get`, `now_aggregate`, `now_update` and `now_insert` check each request against the table's fields and choice lists, read once per table from the UI Meta API (`/api/now/ui/meta/<table>`). They raise `now_data.query_check.QueryRefused`, a `ValueError` whose message carries the fix, for:
 
 - an unknown table, field or dot-walk step (in the query, `fields`, `group_by` or `*_fields`);
 - spaces or quotes around an operator;
-- a choice field given a label or an unknown value (`state stores '1' for 'new': use state=1`), including in `now_update` values, where ServiceNow would discard it and still report success;
+- a choice field given a label or an unknown value (`state stores '1' for 'new': use state=1`), including in `now_update` and `now_insert` values, where ServiceNow would discard it and still report success;
 - an operator ServiceNow doesn't apply (`state~1`, a bare field);
 - text operators on a number-stored choice;
 - a repeated operator (`active==true`);
@@ -54,6 +55,18 @@ curl -s -o /dev/null -w "%{http_code}\n" -u "$SN_USER:$SN_PASSWORD" \
 `200` means the checks work for that user. Verified: an admin-level developer user and whitcortex's integration identity both get `200`. For a locked-down integration user, ask the instance admin which ACL or role opens `/api/now/ui/meta`, and record the answer here.
 
 The rules and their measurements come from whitcortex (#2626, ADR-0134). What's accepted as applied (case-insensitive string choices, `state=01`) reflects that developer instance's collation, not a ServiceNow guarantee. Known limits: a misspelling that starts with a real operator (`stateLIKES`) passes; a retired choice (missing from UI Meta) is refused; catalog `variables.*` are refused.
+
+**Writes are read back.** ServiceNow can answer a write with success and keep another value: a business rule calls `setAbortAction`, a data policy or an ACL strips the field. So a confirmed write re-reads the record by `sys_id` and compares each value's stored raw value (a reference as a sys_id, a choice as its stored value) with what was sent. A date given to a Date/Time field that reads back at `00:00:00` counts as equal, and so does surrounding whitespace. Give a reference field a sys_id. A display name that the instance resolves reads back as a sys_id, so it's reported as not applied.
+
+- **`now_update`** returns `{confirmed, action, table, sys_id, changed_fields, not_applied, journal_unconfirmed, no_ops, unknown_fields}`, plus a `note` when `not_applied` or `journal_unconfirmed` isn't empty.
+  - `changed_fields` lists the changes that **landed**.
+  - `not_applied` lists `{field, requested, actual}` for each field the record holds another value for.
+  - `action` is `"updated"` only when `not_applied` is empty. Otherwise it's `"partially_applied"` when something landed or may have, and `"not_applied"` when nothing did.
+  - Journal fields (type `journal_input` or `journal`, e.g. `work_notes`, `comments`) read back empty, so each is confirmed by a **new** `sys_journal_field` entry with its text instead. The entries that already match are read before the write, so an identical older note doesn't count. A journal field that can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note may have landed, and a retry would duplicate it. If the account can't read `sys_journal_field` at all, the update raises before writing anything.
+  - It raises `RuntimeError` when `update()` doesn't return the record's sys_id, or when the record can't be read back.
+- **`now_insert`** returns `{confirmed, action, sys_id, table, differences}`, plus a `note` when there are differences. `action` is `"inserted"`, or `"inserted_with_differences"` with `differences` as `{field, requested, actual}`. It raises `RuntimeError` when the instance returns no sys_id. When the new row can't be read back, it raises with a message that names the sys_id: the row exists, and retrying would create a second one. Journal fields aren't confirmed through the journal on insert, so a work note given to `now_insert` is listed as a difference. Use `now_update` to add one.
+
+> **Changed in 0.6.0.** `changed_fields` used to be the pre-write diff, reported without a read-back. It now lists only what landed. `not_applied` and `journal_unconfirmed` are new, and `action` is no longer always `"updated"`. Code that read `changed_fields` as "sent" should check `action`.
 
 ## Credentials
 
@@ -93,7 +106,8 @@ from now_data import verbs
 
 verbs.now_query("incident", "active=true^priority=1", fields="number,short_description", limit=5)
 preview = verbs.now_update("incident", sys_id, {"state": "2"})          # writes nothing
-verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # writes
+verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # writes, then reads back
+verbs.now_insert("label", {"name": "Router"})                            # inserts nothing
 ```
 
 ## Exporting a snapshot for now-config

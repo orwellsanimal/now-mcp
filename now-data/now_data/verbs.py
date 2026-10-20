@@ -1,9 +1,11 @@
 """The now-data verbs as plain functions: no MCP import, safe under App Control.
 
 Read verbs (`now_query`, `now_get`, `now_aggregate`) do not mutate the instance.
-Write verbs (`now_update`, `now_run_script`) are gated by `confirmed`: the
-default (`confirmed=False`) returns a dry-run preview and touches nothing; only
-`confirmed=True` performs the mutation.
+Write verbs (`now_update`, `now_insert`, `now_run_script`) are gated by
+`confirmed`: the default (`confirmed=False`) returns a dry-run preview and
+touches nothing; only `confirmed=True` performs the mutation. A confirmed
+update or insert is read back, and reports what the record holds, not what was
+sent (now-mcp#3).
 
 Credentials and the hibernation guard live in `client.py`; the aggregate layer
 in `aggregate.py`. Import these functions to use the verbs as a library;
@@ -17,9 +19,10 @@ from typing import Any
 from now_data.aggregate import sn_aggregate
 from now_data.client import get_client
 from now_data.names import check_table
+from now_data.query_check import QueryRefused, table_columns, unknown_fields
 from now_data.query_check import check as check_request
 
-__all__ = ["now_query", "now_get", "now_aggregate", "now_update", "now_run_script"]
+__all__ = ["now_query", "now_get", "now_aggregate", "now_update", "now_insert", "now_run_script"]
 
 # Cap result-set size so a careless query can't flood agent context. Callers
 # may raise `limit` up to MAX_LIMIT; anything higher is clamped (not an error).
@@ -142,6 +145,104 @@ def now_aggregate(
     )
 
 
+# ── Writes are read back (now-mcp#3) ─────────────────────────────────────────
+#
+# ServiceNow can answer a write with success and keep something else: a business
+# rule's setAbortAction, a data policy, an ACL that strips a field. whitcortex hit
+# exactly that (#2611, #2627), so a confirmed write re-reads what it wrote and says
+# what the record holds. Ported from whitcortex tools/servicenow.py.
+
+# Column types whose value isn't kept on the record: a write appends a
+# sys_journal_field row and the field reads back empty (work_notes and comments are
+# journal_input in sys_dictionary). Told apart by the UI Meta column type that
+# query_check already reads, not by name, so a custom journal field counts too.
+_JOURNAL_TYPES = {"journal", "journal_input"}
+
+
+def _is_journal(column: dict | None) -> bool:
+    column = column or {}
+    return column.get("internal_type") in _JOURNAL_TYPES or column.get("type") in _JOURNAL_TYPES
+
+
+def _as_stored(value: Any) -> str:
+    """`value` written the way the record stores it, for comparing with a read-back."""
+    if value is None:
+        return ""  # a null write clears the field
+    if isinstance(value, bool):  # JSON true from an MCP client; the record holds 'true'
+        return "true" if value else "false"
+    return str(value).strip()
+
+
+def _same_value(given: Any, back: Any) -> bool:
+    """The stored raw value is what was asked for.
+
+    A date given to a Date/Time field reads back with a midnight time (task.due_date
+    is Date/Time, measured on dev442835 2026-10-13; whitcortex PR #2650 review), and
+    surrounding whitespace is the platform's to trim. Ported from whitcortex
+    `_same_value`. Raw values, not display: a reference compares as a sys_id and a
+    choice as its stored value (now-mcp#3).
+    """
+    given, back = _as_stored(given), "" if back is None else str(back).strip()
+    return back == given or back == f"{given} 00:00:00"
+
+
+def _read_back(client: Any, table: str, sys_id: str, fields: list[str]) -> tuple[Any, str]:
+    """(record, "") re-read by sys_id with `fields` as raw values, or (None, why not).
+
+    A query, not get(): whitcortex measured real pysnc raising KeyError('result') on a
+    missing record's 404 body rather than returning False (#2609). Never raises: by
+    the time this runs the write was accepted, so the caller must say so, not let a
+    bare error read as "nothing happened" (whitcortex PR #2650 review).
+    """
+    try:
+        gr = client.GlideRecord(table)
+        gr.fields = ["sys_id", *fields]
+        gr.add_query("sys_id", sys_id)
+        gr.query()
+        if gr.next():
+            return gr, ""
+        return None, "no row came back when it was read again (it may not be readable by this account)"
+    except Exception as e:
+        return None, f"reading it back failed ({type(e).__name__}: {e})"
+
+
+def _journal_text(text: Any) -> str:
+    return ("" if text is None else str(text)).replace("\r\n", "\n").strip()
+
+
+def _journal_entries(client: Any, sys_id: str, element: str, text: str) -> set[str]:
+    """sys_ids of the record's `element` journal entries whose text is `text`.
+
+    A journal field has no value to read back, so the journal is the receipt.
+    Ported from whitcortex `_journal_entries` (#2609).
+    """
+    gr = client.GlideRecord("sys_journal_field")
+    gr.fields = ["sys_id", "value"]
+    gr.add_query("element_id", sys_id)
+    gr.add_query("element", element)
+    gr.query()
+    wanted = _journal_text(text)
+    found = set()
+    while gr.next():
+        if _journal_text(gr.get_value("value")) == wanted:
+            found.add(str(gr.get_value("sys_id")))
+    return found
+
+
+def _journal_landed(client: Any, sys_id: str, element: str, text: str, before: set[str]) -> bool:
+    """A NEW entry with `text` is in the journal: one that wasn't there before the write.
+
+    Unconfirmed is not "failed": the journal may just be unreadable to this account,
+    and the note landed (whitcortex `_write_journal`, #2609). So a read that fails
+    after the write counts as unconfirmed too, rather than an exception that invites
+    retrying the note.
+    """
+    try:
+        return bool(_journal_entries(client, sys_id, element, text) - before)
+    except Exception:
+        return False
+
+
 def now_update(
     table: str,
     sys_id: str,
@@ -165,6 +266,20 @@ def now_update(
     `state="In Progress"` is refused with `use state=2`. Raises
     `query_check.QueryRefused` (a ValueError) for that, and ValueError if no
     record with that sys_id exists.
+
+    A confirmed update is **read back** (now-mcp#3). ServiceNow can report
+    success and keep another value, so each requested field's stored raw value is
+    compared with what was sent. `changed_fields` lists the changes that landed;
+    `not_applied` lists `{field, requested, actual}` for each field the record
+    holds something else for. `action` is `"updated"` only when `not_applied` is
+    empty, else `"partially_applied"` (something landed) or `"not_applied"`.
+
+    Journal fields (`work_notes`, `comments`) read back empty, so each is
+    confirmed by a new `sys_journal_field` entry with its text instead. One that
+    can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note
+    may have landed, and calling it failed invites a duplicate. A `note` explains
+    either list when it isn't empty. Raises RuntimeError if `update()` doesn't
+    return the record's sys_id, or if the record can't be read back.
     """
     client = get_client()
     check_request(client, check_table(table), values=values)
@@ -179,10 +294,12 @@ def now_update(
     known = {f: v for f, v in values.items() if f in existing}
     unknown = sorted(f for f in values if f not in existing)
 
+    # The same rule as the read-back, so a field the read-back calls unchanged
+    # (a date on a Date/Time field, `true` on a boolean) isn't previewed as a change.
     changes = [
         {"field": f, "current": existing.get(f), "proposed": v}
         for f, v in known.items()
-        if str(existing.get(f)) != str(v)
+        if not _same_value(v, existing.get(f))
     ]
     no_ops = sorted(f for f in known if f not in {c["field"] for c in changes})
 
@@ -198,18 +315,179 @@ def now_update(
             "note": "Dry run — nothing written. Call again with confirmed=true to apply.",
         }
 
+    record_id = str(existing.get("sys_id") or sys_id)
+    columns = table_columns(client, table)  # read, and cached, by the check above
+    journal = {f for f in known if _is_journal(columns.get(f))}
+    # Entries that already carry the text are snapshotted BEFORE the write, and a match
+    # afterwards must be a new one: an identical older note ("customer contacted")
+    # would otherwise confirm a write that never happened (whitcortex PR #2610 review).
+    # Read first on purpose: an account that can't read the journal at all raises
+    # here, so a note that could never be confirmed is not sent blind (PR #2610
+    # re-review).
+    journal_texts = {c["field"]: c["proposed"] for c in changes if c["field"] in journal}
+    before = {f: _journal_entries(client, record_id, f, t) for f, t in journal_texts.items()}
+
     for f, v in known.items():
         gr.set_value(f, v)
-    gr.update()
-    return {
+    saved = gr.update()
+    # update() returns the sys_id it saved; anything else is not a save (whitcortex
+    # `_save`, #2609).
+    if not saved or str(saved) != record_id:
+        raise RuntimeError(
+            f"{table} {record_id}: not saved; the instance did not confirm the update "
+            f"(update() returned {saved!r})."
+        )
+
+    compare = [f for f in known if f not in journal]
+    back = None
+    if compare:
+        back, problem = _read_back(client, table, record_id, compare)
+        if back is None:
+            raise RuntimeError(
+                f"{table} {record_id}: the update was accepted, but {problem}, so what it "
+                "changed is unconfirmed. Check the record before retrying."
+            )
+    not_applied = [
+        {"field": f, "requested": known[f], "actual": back.get_value(f)}
+        for f in compare
+        if not _same_value(known[f], back.get_value(f))
+    ]
+    journal_unconfirmed = [
+        f for f, t in journal_texts.items() if not _journal_landed(client, record_id, f, t, before[f])
+    ]
+    missed = {d["field"] for d in not_applied} | set(journal_unconfirmed)
+    changed_fields = [c["field"] for c in changes if c["field"] not in missed]
+
+    if not not_applied:
+        action = "updated"
+    elif changed_fields or journal_unconfirmed:
+        # An unconfirmed note may have landed, so "not_applied" (nothing landed) would
+        # be a claim this can't make, and would invite retrying the note with the rest.
+        action = "partially_applied"
+    else:
+        action = "not_applied"
+
+    result = {
         "confirmed": True,
-        "action": "updated",
+        "action": action,
         "table": table,
         "sys_id": sys_id,
-        "changed_fields": [c["field"] for c in changes],
-        "no_ops": no_ops,
+        "changed_fields": changed_fields,
+        "not_applied": not_applied,
+        "journal_unconfirmed": journal_unconfirmed,
+        # A field that held the value before the write but not after is in not_applied.
+        "no_ops": [f for f in no_ops if f not in missed],
         "unknown_fields": unknown,
     }
+    notes = []
+    if not_applied:
+        notes.append(
+            "The instance accepted the update but holds another value for "
+            + ", ".join(d["field"] for d in not_applied)
+            + " (see `actual`): a business rule, data policy or ACL can do that without an error."
+        )
+    if journal_unconfirmed:
+        notes.append(
+            f"A new {' / '.join(journal_unconfirmed)} entry with that text could not be confirmed "
+            "in the record's journal (it may not be readable by this account). Check the record "
+            "before retrying, or the note may be duplicated."
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
+def now_insert(
+    table: str,
+    values: dict[str, Any],
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Insert one record — GATED by `confirmed`.
+
+    `values` maps field name → value. With `confirmed=False` (the default) this
+    is a **dry run**: it checks `values` against the table's fields and returns a
+    preview (`values`, `unknown_fields`) without touching the instance otherwise.
+    Call again with `confirmed=True` to insert.
+
+    Fields that aren't columns of the table are reported under `unknown_fields`
+    in the preview, and a confirmed insert that names one is refused with
+    `query_check.QueryRefused` and inserts nothing. ServiceNow silently drops a
+    value for a column that doesn't exist; an update can simply be run again
+    without it, but a second insert is a second row. Choice fields are checked as
+    in `now_update`.
+
+    A confirmed insert reads every value back and returns the new `sys_id` with
+    `action: "inserted"`, or `"inserted_with_differences"` and `differences`
+    (`{field, requested, actual}`) when the row holds something else (a business
+    rule can override a value on insert). Raises RuntimeError if the instance
+    returns no sys_id, or, naming the sys_id, if the new row can't be read back.
+    Either way a row that exists is named, so it isn't inserted twice. Journal
+    fields aren't confirmed through the journal here (they read back empty and
+    show as differences): add a work note with `now_update`.
+    """
+    client = get_client()
+    table = check_table(table)
+    check_request(client, table, values=values)
+    unknown = unknown_fields(client, table, values)
+
+    if not confirmed:
+        return {
+            "confirmed": False,
+            "action": "preview",
+            "table": table,
+            "values": values,
+            "unknown_fields": unknown,
+            "note": (
+                "Dry run — nothing inserted. Call again with confirmed=true to insert"
+                + (", after removing or correcting unknown_fields: a confirmed insert "
+                   "refuses them." if unknown else ".")
+            ),
+        }
+    if unknown:
+        noun, them = ("field", "it") if len(unknown) == 1 else ("fields", "them")
+        raise QueryRefused(
+            f"nothing was inserted: {table} has no {noun} {', '.join(unknown)}, and ServiceNow "
+            f"would create the row without {them}. Correct or remove {them} and call again."
+        )
+
+    gr = client.GlideRecord(table)
+    gr.initialize()
+    for f, v in values.items():
+        gr.set_value(f, v)
+    created = gr.insert()
+    if not created:
+        raise RuntimeError(f"{table}: not inserted; the instance returned no sys_id.")
+    sys_id = str(created)
+
+    # From here on the row exists, so every outcome names it: a message that reads as
+    # "nothing happened" invites a retry that duplicates it (whitcortex `_insert_checked`,
+    # #2611, PR #2650 review).
+    back, problem = _read_back(client, table, sys_id, list(values))
+    if back is None:
+        raise RuntimeError(
+            f"{table} {sys_id} was created (insert() returned its sys_id), but {problem}. "
+            "Do not retry the insert; check the record."
+        )
+    differences = [
+        {"field": f, "requested": v, "actual": back.get_value(f)}
+        for f, v in values.items()
+        if not _same_value(v, back.get_value(f))
+    ]
+    result = {
+        "confirmed": True,
+        "action": "inserted_with_differences" if differences else "inserted",
+        "sys_id": sys_id,
+        "table": table,
+        "differences": differences,
+    }
+    if differences:
+        result["note"] = (
+            f"Created as {table} {sys_id}, but it holds another value for "
+            + ", ".join(d["field"] for d in differences)
+            + " (see `actual`): a business rule or data policy can override a value on insert. "
+            "Do not retry the insert, which would create a second row; check the record."
+        )
+    return result
 
 
 # Scripted REST endpoint that backs the confirmed execution path. It is not part

@@ -249,7 +249,8 @@ def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]]
     `query` is an encoded query. `fields` maps a label for the message (e.g.
     "group_by") to field names that must exist. `values` are field -> value pairs
     to be written; a choice field must get a value it stores. Unknown fields in
-    `values` are left to the caller (now_update reports them itself).
+    `values` are left to the caller (now_update reads them off the record;
+    now_insert, which has no record, asks `unknown_fields`).
 
     Raises FieldsUnreadable when the table's fields can't be read: fail closed.
     """
@@ -265,3 +266,19 @@ def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]]
             "this request would give a wrong or unchecked result, so nothing was run: "
             + "; ".join(problems) + "."
         )
+
+
+def unknown_fields(client: Any, table: str, names: Any) -> list[str]:
+    """The names in `names` that are not columns of `table`, sorted.
+
+    For a write with no record to read the fields off (now_insert). ServiceNow
+    silently drops a value for a column that doesn't exist, so these must be
+    reported, not sent. A name is reported only after the columns are re-read once:
+    the cache may predate a field added since, as in `check`.
+    """
+    names = list(names)
+    unknown = sorted(n for n in names if n not in table_columns(client, table))
+    if unknown:
+        _COLUMNS.pop((client.instance, table), None)
+        unknown = sorted(n for n in names if n not in table_columns(client, table))
+    return unknown
