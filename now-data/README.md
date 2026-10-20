@@ -56,17 +56,40 @@ curl -s -o /dev/null -w "%{http_code}\n" -u "$SN_USER:$SN_PASSWORD" \
 
 The rules and their measurements come from whitcortex (#2626, ADR-0134). What's accepted as applied (case-insensitive string choices, `state=01`) reflects that developer instance's collation, not a ServiceNow guarantee. Known limits: a misspelling that starts with a real operator (`stateLIKES`) passes; a retired choice (missing from UI Meta) is refused; catalog `variables.*` are refused.
 
-**Writes are read back.** ServiceNow can answer a write with success and keep another value: a business rule calls `setAbortAction`, a data policy or an ACL strips the field. So a confirmed write re-reads the record by `sys_id` and compares each value's stored raw value (a reference as a sys_id, a choice as its stored value) with what was sent. A date given to a Date/Time field that reads back at `00:00:00` counts as equal, and so does surrounding whitespace. Give a reference field a sys_id. A display name that the instance resolves reads back as a sys_id, so it's reported as not applied.
+**Writes are read back.** ServiceNow can answer a write with success and keep another value: a business rule calls `setAbortAction`, a data policy or an ACL strips the field. So a confirmed write re-reads the record by `sys_id` and compares each value's stored raw value (a reference as a sys_id, a choice as its stored value) with what was sent.
+
+What counts as equal:
+- A date given to a Date/Time field that reads back at `00:00:00`.
+- Surrounding whitespace.
+- On a number column (UI Meta `internal_type` integer, longint, decimal or float), the same number written differently: `state="02"` stored as `2`.
+
+Known limits: give a reference field a sys_id, because a display name that the instance resolves reads back as a sys_id and is reported as not applied. A boolean given `"1"` is compared as text, since what the platform stores for it hasn't been measured.
 
 - **`now_update`** returns `{confirmed, action, table, sys_id, changed_fields, not_applied, journal_unconfirmed, no_ops, unknown_fields}`, plus a `note` when `not_applied` or `journal_unconfirmed` isn't empty.
   - `changed_fields` lists the changes that **landed**.
-  - `not_applied` lists `{field, requested, actual}` for each field the record holds another value for.
-  - `action` is `"updated"` only when `not_applied` is empty. Otherwise it's `"partially_applied"` when something landed or may have, and `"not_applied"` when nothing did.
-  - Journal fields (type `journal_input` or `journal`, e.g. `work_notes`, `comments`) read back empty, so each is confirmed by a **new** `sys_journal_field` entry with its text instead. The entries that already match are read before the write, so an identical older note doesn't count. A journal field that can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note may have landed, and a retry would duplicate it. If the account can't read `sys_journal_field` at all, the update raises before writing anything.
-  - It raises `RuntimeError` when `update()` doesn't return the record's sys_id, or when the record can't be read back.
-- **`now_insert`** returns `{confirmed, action, sys_id, table, differences}`, plus a `note` when there are differences. `action` is `"inserted"`, or `"inserted_with_differences"` with `differences` as `{field, requested, actual}`. It raises `RuntimeError` when the instance returns no sys_id. When the new row can't be read back, it raises with a message that names the sys_id: the row exists, and retrying would create a second one. Journal fields aren't confirmed through the journal on insert, so a work note given to `now_insert` is listed as a difference. Use `now_update` to add one.
+  - `not_applied` lists `{field, requested, actual, reason}` for everything asked for that the record doesn't hold. `reason` is one of:
+    - `"value_differs"`: written, but the record holds `actual`.
+    - `"unknown_field"`: not a field of the table, so it wasn't sent.
+    - `"unreadable_field"`: a field of the table that isn't on the record as this account reads it (a field ACL), so it wasn't sent.
 
-> **Changed in 0.6.0.** `changed_fields` used to be the pre-write diff, reported without a read-back. It now lists only what landed. `not_applied` and `journal_unconfirmed` are new, and `action` is no longer always `"updated"`. Code that read `changed_fields` as "sent" should check `action`.
+    The unsent fields are in `unknown_fields` too, with `actual: null`. A confirmed update in which **no** field is on the record (a misspelt `work_note`, say) is refused with `QueryRefused` and writes nothing.
+  - `action` is `"updated"` only when `not_applied` is empty. Otherwise it's `"partially_applied"` when something landed or may have, and `"not_applied"` when nothing did.
+  - Journal fields (type `journal_input` or `journal`, e.g. `work_notes`, `comments`) read back empty, so each is confirmed by a **new** `sys_journal_field` entry with its text instead. The type comes from the UI Meta columns: on a PDI on 2026-10-19, incident's `work_notes` and `comments` read `internal_type` and `type` `journal_input` (`tests/fixtures/ui_meta/incident.json`). The entries that already match are read before the write, so an identical older note doesn't count. A journal field that can't be confirmed goes in `journal_unconfirmed`, not `not_applied`: the note may have landed, and a retry would duplicate it.
+    - If reading the journal before the write fails with an HTTP error (pysnc raises on a 403), the update raises and writes nothing.
+    - A read ACL that filters the rows answers 200 with none, so the update goes ahead and the note comes back in `journal_unconfirmed`.
+  - **`"updated"` means nothing was kept back, not that everything was confirmed.** It can come with a non-empty `journal_unconfirmed`, so read `journal_unconfirmed` whatever the `action`.
+- **`now_insert`** returns `{confirmed, action, sys_id, table, differences}`, plus a `note` when there are differences.
+  - `action` is `"inserted"`, or `"inserted_with_differences"` with `differences` as `{field, requested, actual}`.
+  - Journal fields aren't confirmed through the journal on insert, so a work note given to `now_insert` is listed as a difference. Use `now_update` to add one.
+
+**A write that can't be confirmed raises `now_data.verbs.WriteUnconfirmed`** (a `RuntimeError`). It's raised once the write may have reached the instance:
+- the connection failed after the request may have been sent, or the instance answered with an error status that pysnc 1.2.1 doesn't keep (pysnc raises a bare `RequestException` for a 400 and a 5xx alike, so both are treated as "may have landed");
+- the answer had no sys_id (for an insert, a read ACL can hide it from the answer);
+- the record can't be read back. For an insert, the message names the new sys_id.
+
+Check the record before retrying: a blind retry can duplicate a row or a journal entry. A 401, 403 or 404 answer means the instance refused the write, so nothing was written. pysnc's `AuthenticationException`, `RoleException` or `NotFoundException` is raised as it is.
+
+> **Changed in 0.6.0.** `changed_fields` used to be the pre-write diff, reported without a read-back. It now lists only what landed. `not_applied` and `journal_unconfirmed` are new, `action` is no longer always `"updated"`, and an unknown field makes it `"partially_applied"` or `"not_applied"`. Code that read `changed_fields` as "sent" should check `action` and `journal_unconfirmed`.
 
 ## Credentials
 

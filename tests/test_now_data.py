@@ -1,5 +1,8 @@
 """now-data verbs against an in-memory fake PySNC client (no network)."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from now_data import query_check, verbs
@@ -20,6 +23,10 @@ GENERIC = {
     "comments": {"type": "journal_input", "internal_type": "journal_input"},
     "due_date": {"type": "glide_date_time", "internal_type": "glide_date_time"},
 }
+
+# incident's columns as a PDI's UI Meta API answered them (read-only GET of /api/now/ui/meta/incident,
+# 2026-10-19, now-mcp#18 review): work_notes / comments are journal_input, state is integer.
+MEASURED = json.loads((Path(__file__).parent / "fixtures" / "ui_meta" / "incident.json").read_text(encoding="utf-8"))
 
 
 @pytest.fixture(autouse=True)
@@ -45,8 +52,10 @@ class FakeGR:
         self.filters.append((field, value))
 
     def query(self):
-        if self.table in self.client.query_errors:
-            raise self.client.query_errors[self.table]
+        c = self.client
+        errors = {**c.query_errors, **(c.after_write_query_errors if c.written else {})}
+        if self.table in errors:
+            raise errors[self.table]
         self._rows = [r for r in self.db.get(self.table, {}).values()
                       if self.table not in self.client.unreadable
                       and all(str(r.get(f)) == str(v) for f, v in self.filters)]
@@ -81,32 +90,39 @@ class FakeGR:
         for f, v in self.updates.items():
             if f in c.drop:  # a business rule that keeps the old value, and still answers 200
                 continue
-            if GENERIC.get(f, {}).get("internal_type") == "journal_input":
+            # By name: how the fake INSTANCE stores it, apart from the column metadata the verb reads.
+            if f in c.journal_fields:
                 rec[f] = ""  # a journal field reads back empty...
                 if c.journal_writes:  # ...and its entry goes to the journal
                     n = len(self.db.setdefault("sys_journal_field", {}))
                     self.db["sys_journal_field"][f"j{n}"] = {
                         "sys_id": f"j{n}", "element_id": sys_id, "element": f,
-                        "value": str(v).replace("\n", "\r\n") + "\r\n"}
+                        "value": str(v).replace("\n", "\r\n") + "\r\n", **c.journal_misroute}
                 continue
             rec[f] = c.coerce.get(f, lambda x: x)(v)
 
     def update(self):
+        if self.client.write_error is not None:
+            raise self.client.write_error
         if self.client.update_returns is not REAL:
             return self.client.update_returns
         self._store(self._rec, self._rec["sys_id"])
+        self.client.written = True
         return self._rec["sys_id"]
 
     def initialize(self):
         self._rec, self.updates = {}, {}
 
     def insert(self):
+        if self.client.write_error is not None:
+            raise self.client.write_error
         if self.client.insert_returns is not REAL:
             return self.client.insert_returns
         rows = self.db.setdefault(self.table, {})
         sys_id = f"new{len(rows)}"
         rows[sys_id] = {"sys_id": sys_id}
         self._store(rows[sys_id], sys_id)
+        self.client.written = True
         return sys_id
 
 
@@ -122,11 +138,16 @@ class FakeClient:
         self.session = FakeSession(None)
         self.records = []  # every GlideRecord made, so a test can see what was touched
         # What the fake instance does with a write: `drop` fields keep their old value (a business
-        # rule, and still a 200), `coerce` maps a value to what is stored, and journal fields add a
-        # sys_journal_field entry unless `journal_writes` is off.
+        # rule, and still a 200), `coerce` maps a value to what is stored, and `journal_fields` add a
+        # sys_journal_field entry unless `journal_writes` is off; `journal_misroute` overrides the
+        # entry's keys (it lands on another record or field). `write_error` is raised by
+        # update()/insert(); `written` says one stored something.
         self.drop, self.coerce, self.journal_writes = set(), {}, True
-        # Reads: a table in `unreadable` queries as no rows (ACL-hidden); `query_errors` raise.
-        self.unreadable, self.query_errors = set(), {}
+        self.journal_fields, self.journal_misroute = {"work_notes", "comments"}, {}
+        self.write_error, self.written = None, False
+        # Reads: a table in `unreadable` queries as no rows (ACL-hidden); `query_errors` raise, and
+        # `after_write_query_errors` raise only once something was written.
+        self.unreadable, self.query_errors, self.after_write_query_errors = set(), {}, {}
         self.update_returns = self.insert_returns = REAL
 
     def GlideRecord(self, table):
@@ -142,6 +163,13 @@ def client(monkeypatch):
     c = FakeClient(db)
     monkeypatch.setattr(verbs, "get_client", lambda: c)
     return c
+
+
+@pytest.fixture
+def measured(client):
+    """The fake instance answers UI Meta for incident with the measured columns (MEASURED)."""
+    client.session.columns["incident"] = MEASURED
+    return client
 
 
 def test_query_truncates_and_clamps(client):
@@ -165,11 +193,42 @@ def test_update_previews_by_default_and_writes_only_when_confirmed(client):
     assert p["unknown_fields"] == ["bogus"]
     assert client.db["incident"]["id1"]["state"] == "1"  # nothing written
 
-    done = verbs.now_update("incident", "id1", {"state": "2", "bogus": "y"}, confirmed=True)
-    assert done["action"] == "updated" and done["changed_fields"] == ["state"]
-    assert done["not_applied"] == [] and done["journal_unconfirmed"] == [] and "note" not in done
+    done = verbs.now_update("incident", "id1", {"state": "2", "short_description": "y"}, confirmed=True)
+    assert done == {"confirmed": True, "action": "updated", "table": "incident", "sys_id": "id1",
+                    "changed_fields": ["state", "short_description"], "not_applied": [],
+                    "journal_unconfirmed": [], "no_ops": [], "unknown_fields": []}
     assert client.db["incident"]["id1"]["state"] == "2"
-    assert "bogus" not in client.db["incident"]["id1"]
+
+
+# ── now-mcp#18 review: a field that wasn't sent is not applied, never "updated" ──
+
+def test_update_with_an_unknown_field_is_not_updated(client):
+    done = verbs.now_update("incident", "id1", {"state": "2", "bogus": "y"}, confirmed=True)
+    assert done["action"] == "partially_applied"
+    assert done["changed_fields"] == ["state"] and done["unknown_fields"] == ["bogus"]
+    assert done["not_applied"] == [{"field": "bogus", "requested": "y", "actual": None, "reason": "unknown_field"}]
+    assert "Not sent: bogus" in done["note"]
+    assert client.db["incident"]["id1"]["state"] == "2" and "bogus" not in client.db["incident"]["id1"]
+
+
+@pytest.mark.parametrize("values", [{"u_typo": "n"}, {"work_note": "Called the user"}, {}],
+                         ids=["typo", "work_note", "empty"])
+def test_a_confirmed_update_with_no_field_on_the_record_writes_nothing(client, values):
+    with pytest.raises(query_check.QueryRefused, match="nothing was written"):
+        verbs.now_update("incident", "id1", values, confirmed=True)
+    assert client.written is False
+    assert verbs.now_update("incident", "id1", values)["unknown_fields"] == sorted(values)  # the preview reports
+
+
+def test_a_field_hidden_by_a_read_acl_is_unreadable_and_not_sent(client):
+    del client.db["incident"]["id1"]["work_notes"]  # a column of the table, missing from the record as read
+    with pytest.raises(query_check.QueryRefused, match="has no field work_notes as this account reads it"):
+        verbs.now_update("incident", "id1", {"work_notes": "note"}, confirmed=True)
+    done = verbs.now_update("incident", "id1", {"work_notes": "note", "state": "2"}, confirmed=True)
+    assert done["not_applied"] == [{"field": "work_notes", "requested": "note", "actual": None,
+                                    "reason": "unreadable_field"}]
+    assert done["action"] == "partially_applied" and done["changed_fields"] == ["state"]
+    assert "sys_journal_field" not in client.db  # never sent
 
 
 # ── now-mcp#3: a confirmed write is read back ────────────────────────────────
@@ -180,12 +239,12 @@ def test_update_a_field_that_does_not_take_is_not_applied(client):
     done = verbs.now_update("incident", "id1", {"state": "2", "short_description": "moved"}, confirmed=True)
     assert done["action"] == "partially_applied"
     assert done["changed_fields"] == ["short_description"]
-    assert done["not_applied"] == [{"field": "state", "requested": "2", "actual": "1"}]
+    assert done["not_applied"] == [{"field": "state", "requested": "2", "actual": "1", "reason": "value_differs"}]
     assert "state" in done["note"] and "business rule" in done["note"]
 
     nothing = verbs.now_update("incident", "id2", {"state": "2"}, confirmed=True)
     assert nothing["action"] == "not_applied" and nothing["changed_fields"] == []
-    assert nothing["not_applied"] == [{"field": "state", "requested": "2", "actual": "1"}]
+    assert nothing["not_applied"] == [{"field": "state", "requested": "2", "actual": "1", "reason": "value_differs"}]
 
 
 def test_update_reads_back_by_sys_id_only_the_fields_it_wrote(client):
@@ -199,24 +258,75 @@ def test_update_a_no_op_that_a_rule_changes_is_not_applied_not_a_no_op(client):
     client.coerce = {"short_description": lambda v: "rewritten by a rule"}
     done = verbs.now_update("incident", "id1", {"state": "2", "short_description": "x1"}, confirmed=True)
     # short_description already held x1 and was not sent as a change; the rule changed it anyway.
-    assert done["not_applied"] == [{"field": "short_description", "requested": "x1", "actual": "rewritten by a rule"}]
+    assert done["not_applied"] == [{"field": "short_description", "requested": "x1",
+                                    "actual": "rewritten by a rule", "reason": "value_differs"}]
     assert done["no_ops"] == [] and done["changed_fields"] == ["state"]
     assert done["action"] == "partially_applied"
 
 
 @pytest.mark.parametrize("answer", [None, "", "some-other-sys-id"])
-def test_update_not_confirmed_by_update_raises(client, answer):
-    client.update_returns = answer
-    with pytest.raises(RuntimeError, match=r"incident id1: not saved; the instance did not confirm the update"):
+def test_update_answered_without_its_sys_id_is_unconfirmed(client, answer):
+    client.update_returns = answer  # a 200 whose answer lacks the sys_id: it may have landed
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident id1: the update may have been applied: "
+                                                     r"the answer didn't carry the record's sys_id"):
         verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
 
 
 def test_update_that_cannot_be_read_back_raises_and_says_it_was_accepted(client):
     client.unreadable = {"incident"}  # get() finds it; the read-back query sees no row
-    with pytest.raises(RuntimeError, match=r"incident id1: the update was accepted, but no row came back.*"
-                                           r"Check the record before retrying"):
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident id1: the update was accepted, but no row came "
+                                                     r"back.*Check the record before retrying"):
         verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
 
+
+# ── now-mcp#18 review: a failure during the write says it may have landed ────
+
+def _maybe_sent():
+    import requests
+    from pysnc import exceptions as px
+    return {
+        "reset": requests.ConnectionError("('Connection aborted.', ConnectionResetError(10054))"),
+        "chunked": requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),
+        "pysnc-no-status": px.RequestException({"error": {"message": "Internal Server Error"}}),
+        "update-503": px.UpdateException({"error": {"message": "Service Unavailable"}}, status_code=503),
+        "insert-502": px.InsertException({"error": {"message": "Bad Gateway"}}, status_code=502),
+        "empty-answer": AttributeError("'GlideRecord' object has no attribute 'sys_id'"),
+    }
+
+
+def _refused():
+    from pysnc import exceptions as px
+    return {
+        "401": px.AuthenticationException({"error": {"message": "User Not Authenticated"}}),
+        "403": px.RoleException({"error": {"message": "Operation Failed", "detail": "ACL Exception"}}),
+        "404": px.NotFoundException({"error": {"message": "No Record found"}}),
+        "update-400": px.UpdateException({"error": {"message": "Bad Request"}}, status_code=400),
+    }
+
+
+@pytest.mark.parametrize("case", list(_maybe_sent()))
+def test_a_write_that_fails_once_it_may_have_been_sent_is_unconfirmed(client, case):
+    client.write_error = _maybe_sent()[case]
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident id1: the update may have been applied: .*"
+                                                     r"Check the record before retrying") as caught:
+        verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
+    assert caught.value.__cause__ is client.write_error
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident: the insert may have been applied: .*"
+                                                     r"A row may exist"):
+        verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
+
+
+@pytest.mark.parametrize("case", list(_refused()))
+def test_a_write_the_instance_refused_is_raised_as_it_is(client, case):
+    client.write_error = _refused()[case]
+    with pytest.raises(type(client.write_error)) as caught:
+        verbs.now_update("incident", "id1", {"state": "2"}, confirmed=True)
+    assert caught.value is client.write_error and not isinstance(caught.value, verbs.WriteUnconfirmed)
+    with pytest.raises(type(client.write_error)):
+        verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
+
+
+# ── journal fields ───────────────────────────────────────────────────────────
 
 def test_journal_field_confirmed_by_a_new_entry(client):
     # An identical older note is there too: it's the NEW entry that confirms.
@@ -232,7 +342,7 @@ def test_journal_field_confirmed_by_a_new_entry(client):
 
 
 def test_journal_field_not_confirmed_by_an_identical_old_entry(client):
-    # The same note was written last week; this write leaves no new entry (e.g. it can't be read).
+    # The same note was written last week; this write leaves no new entry.
     client.db["sys_journal_field"] = {"old": {"sys_id": "old", "element_id": "id1", "element": "work_notes",
                                               "value": "Customer contacted"}}
     client.journal_writes = False
@@ -240,18 +350,27 @@ def test_journal_field_not_confirmed_by_an_identical_old_entry(client):
     assert done["journal_unconfirmed"] == ["work_notes"]
     assert done["not_applied"] == []  # unconfirmed is not "failed": it may have landed
     assert done["changed_fields"] == ["state"]
+    # "updated" means nothing was kept back, not that everything was confirmed (now-mcp#18 review).
     assert done["action"] == "updated"
     assert "could not be confirmed" in done["note"] and "duplicated" in done["note"]
 
 
-def test_journal_entry_on_another_record_or_field_does_not_confirm(client):
-    client.journal_writes = False
-    client.db["sys_journal_field"] = {
-        "a": {"sys_id": "a", "element_id": "id2", "element": "work_notes", "value": "hi"},
-        "b": {"sys_id": "b", "element_id": "id1", "element": "comments", "value": "hi"},
-    }
+@pytest.mark.parametrize("misroute", [{"element_id": "id2"}, {"element": "comments"}], ids=["record", "field"])
+def test_a_new_entry_on_another_record_or_field_does_not_confirm(client, misroute):
+    # The only new entry with the text lands AFTER the snapshot, on another record or field: without
+    # the element_id / element filters it would confirm.
+    client.journal_misroute = misroute
     done = verbs.now_update("incident", "id1", {"work_notes": "hi"}, confirmed=True)
-    assert done["journal_unconfirmed"] == ["work_notes"]
+    assert len(client.db["sys_journal_field"]) == 1  # it was written, just not where it counts
+    assert done["journal_unconfirmed"] == ["work_notes"] and done["changed_fields"] == []
+
+
+def test_a_journal_read_that_fails_after_the_write_is_unconfirmed_not_an_error(client):
+    from pysnc import exceptions as px
+    client.after_write_query_errors = {"sys_journal_field": px.RequestException({"error": "timed out"})}
+    done = verbs.now_update("incident", "id1", {"work_notes": "note", "state": "2"}, confirmed=True)
+    assert client.db["sys_journal_field"]  # the note landed
+    assert done["journal_unconfirmed"] == ["work_notes"] and done["changed_fields"] == ["state"]
 
 
 def test_unconfirmed_journal_with_a_field_not_applied_is_partially_applied(client):
@@ -262,24 +381,82 @@ def test_unconfirmed_journal_with_a_field_not_applied_is_partially_applied(clien
     assert done["action"] == "partially_applied"
 
 
-def test_journal_unreadable_before_the_write_writes_nothing(client):
-    client.query_errors = {"sys_journal_field": RuntimeError("403 Forbidden")}  # pysnc raises on a 403
-    with pytest.raises(RuntimeError, match="403"):
+def test_an_http_error_on_the_journal_snapshot_stops_the_write(client):
+    from pysnc import exceptions as px
+    client.query_errors = {"sys_journal_field": px.RoleException({"error": {"message": "forbidden"}})}  # a 403
+    with pytest.raises(px.RoleException):
         verbs.now_update("incident", "id1", {"work_notes": "note", "state": "2"}, confirmed=True)
-    assert client.db["incident"]["id1"]["state"] == "1"
+    assert client.written is False and client.db["incident"]["id1"]["state"] == "1"
     assert "sys_journal_field" not in client.db
+
+
+def test_an_acl_filtered_journal_snapshot_writes_and_reports_unconfirmed(client):
+    # A read ACL that filters rows answers 200 with none: nothing stops the write, and the note
+    # can't be confirmed (now-mcp#18 review: the safe outcome, but not "nothing written").
+    client.unreadable = {"sys_journal_field"}
+    done = verbs.now_update("incident", "id1", {"work_notes": "note", "state": "2"}, confirmed=True)
+    assert client.written is True and client.db["sys_journal_field"]  # the note landed
+    assert done["journal_unconfirmed"] == ["work_notes"] and done["changed_fields"] == ["state"]
+    assert done["action"] == "updated"
 
 
 def test_journal_type_comes_from_the_column_type_not_the_name(client, monkeypatch):
     # A custom journal field is confirmed by the journal; a string field named like one is compared.
     monkeypatch.setitem(GENERIC, "u_notes", {"type": "journal_input", "internal_type": "journal_input"})
     monkeypatch.setitem(GENERIC, "u_work_notes", {"type": "string"})
+    client.journal_fields = client.journal_fields | {"u_notes"}  # how the fake instance stores it
     client.db["incident"]["id1"].update({"u_notes": "", "u_work_notes": ""})
     client.drop = {"u_work_notes"}
     done = verbs.now_update("incident", "id1", {"u_notes": "a", "u_work_notes": "b"}, confirmed=True)
     assert done["changed_fields"] == ["u_notes"]  # read back empty, confirmed by its new entry
     assert done["journal_unconfirmed"] == []
-    assert done["not_applied"] == [{"field": "u_work_notes", "requested": "b", "actual": ""}]
+    assert done["not_applied"] == [{"field": "u_work_notes", "requested": "b", "actual": "",
+                                    "reason": "value_differs"}]
+
+
+# ── the UI Meta columns measured on a PDI (now-mcp#18 review) ────────────────
+
+def test_the_measured_columns_mark_journal_fields_by_type():
+    assert verbs._is_journal(MEASURED["work_notes"]) and verbs._is_journal(MEASURED["comments"])
+    for name in ("close_notes", "short_description", "state", "assignment_group", "opened_at"):
+        assert not verbs._is_journal(MEASURED[name]), name  # close_notes is notes text, but a string
+    assert MEASURED["state"]["internal_type"] == "integer"
+
+
+def test_journal_confirmed_with_the_measured_columns(measured):
+    # The verb reads the measured metadata; the fake instance journals by field name, so the two
+    # no longer share an assumption.
+    done = verbs.now_update("incident", "id1", {"work_notes": "Called", "comments": "Hi", "state": "2"},
+                            confirmed=True)
+    assert measured.session.meta_reads == ["incident"]
+    assert done["action"] == "updated" and done["journal_unconfirmed"] == []
+    assert done["changed_fields"] == ["work_notes", "comments", "state"]
+    assert {e["element"] for e in measured.db["sys_journal_field"].values()} == {"work_notes", "comments"}
+
+
+def test_close_notes_from_the_measured_columns_is_compared_not_journalled(measured):
+    measured.db["incident"]["id1"]["close_notes"] = ""
+    measured.drop = {"close_notes"}
+    done = verbs.now_update("incident", "id1", {"close_notes": "Fixed"}, confirmed=True)
+    assert done["not_applied"] == [{"field": "close_notes", "requested": "Fixed", "actual": "",
+                                    "reason": "value_differs"}]
+    assert "sys_journal_field" not in measured.db
+
+
+@pytest.mark.parametrize("given", ["02", "2.0", " 2"])
+def test_a_number_the_platform_normalises_is_applied(measured, given):
+    measured.coerce = {"state": lambda v: str(int(float(v)))}  # state is integer (measured): stored as "2"
+    done = verbs.now_update("incident", "id1", {"state": given}, confirmed=True)
+    assert done["action"] == "updated" and done["not_applied"] == [] and done["changed_fields"] == ["state"]
+    # ...and asking for it again is a no-op.
+    assert verbs.now_update("incident", "id1", {"state": given})["no_ops"] == ["state"]
+
+
+def test_a_number_on_a_text_column_is_compared_as_text(measured):
+    measured.coerce = {"short_description": lambda v: str(int(v))}
+    done = verbs.now_update("incident", "id1", {"short_description": "02"}, confirmed=True)
+    assert done["not_applied"] == [{"field": "short_description", "requested": "02", "actual": "2",
+                                    "reason": "value_differs"}]
 
 
 def test_date_given_to_a_date_time_field_reads_back_at_midnight_and_is_equal(client):
@@ -291,19 +468,31 @@ def test_date_given_to_a_date_time_field_reads_back_at_midnight_and_is_equal(cli
     assert verbs.now_update("incident", "id1", {"due_date": "2026-10-20"})["no_ops"] == ["due_date"]
 
 
-@pytest.mark.parametrize("given, back, same", [
-    ("2026-10-20", "2026-10-20 00:00:00", True),
-    ("2026-10-20", "2026-10-20 09:30:00", False),
-    (" x ", "x", True),
-    (True, "true", True),
-    (False, "false", True),
-    (None, "", True),
-    (2, "2", True),
-    ("2", None, False),
-    ("", None, True),
+_INTEGER, _DECIMAL, _TEXT = {"internal_type": "integer"}, {"internal_type": "decimal"}, {"internal_type": "string"}
+
+
+@pytest.mark.parametrize("given, back, column, same", [
+    ("2026-10-20", "2026-10-20 00:00:00", None, True),
+    ("2026-10-20", "2026-10-20 09:30:00", None, False),
+    (" x ", "x", None, True),
+    (True, "true", None, True),
+    (False, "false", None, True),
+    (None, "", None, True),
+    (2, "2", None, True),
+    ("2", None, None, False),
+    ("", None, None, True),
+    ("02", "2", _INTEGER, True),
+    ("1.0", "1", _INTEGER, True),
+    ("2.5", "2", _INTEGER, False),
+    ("1.50", "1.5", _DECIMAL, True),
+    ("02", "2", _TEXT, False),
+    ("02", "2", None, False),
+    ("inf", "inf", _INTEGER, True),  # equal as text; never parsed
+    ("1_0", "10", _INTEGER, False),  # Decimal() would take it; ServiceNow doesn't read it as 10
+    ("", "0", _INTEGER, False),
 ])
-def test_same_value(given, back, same):
-    assert verbs._same_value(given, back) is same
+def test_same_value(given, back, column, same):
+    assert verbs._same_value(given, back, column) is same
 
 
 # ── now_insert ───────────────────────────────────────────────────────────────
@@ -349,22 +538,31 @@ def test_insert_with_a_differing_read_back_names_the_sys_id(client):
     assert sys_id in done["note"] and "Do not retry the insert" in done["note"]
 
 
-def test_insert_without_a_sys_id_raises(client):
-    client.insert_returns = None
-    with pytest.raises(RuntimeError, match="incident: not inserted; the instance returned no sys_id"):
+def test_insert_of_a_number_the_platform_normalises_has_no_difference(measured):
+    measured.coerce = {"state": lambda v: str(int(v))}
+    done = verbs.now_insert("incident", {"short_description": "x", "state": "02"}, confirmed=True)
+    assert done["action"] == "inserted" and done["differences"] == []
+
+
+@pytest.mark.parametrize("answer", [None, ""])
+def test_insert_answered_without_a_sys_id_says_a_row_may_exist(client, answer):
+    client.insert_returns = answer  # a 201 whose answer a read ACL filtered
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident: the insert was answered without a sys_id .*"
+                                                     r"a row may exist\. Do not retry the insert"):
         verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
 
 
 def test_insert_whose_row_cannot_be_read_back_raises_naming_it(client):
     client.unreadable = {"incident"}  # inserted, but this account can't read it
-    with pytest.raises(RuntimeError, match=r"incident new5 was created.*no row came back.*"
-                                           r"Do not retry the insert"):
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident new5 was created.*no row came back.*"
+                                                     r"Do not retry the insert"):
         verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
 
 
 def test_insert_whose_read_back_errors_raises_naming_it(client):
-    client.query_errors = {"incident": KeyError("result")}
-    with pytest.raises(RuntimeError, match=r"incident new5 was created.*reading it back failed \(KeyError"):
+    client.after_write_query_errors = {"incident": KeyError("result")}
+    with pytest.raises(verbs.WriteUnconfirmed, match=r"incident new5 was created.*reading it back failed "
+                                                     r"\(KeyError"):
         verbs.now_insert("incident", {"short_description": "x"}, confirmed=True)
 
 
@@ -402,11 +600,14 @@ class FakeSession:
 
     def __init__(self, resp):
         self.resp, self.gets, self.meta_reads = resp, [], []
+        self.columns = {}  # table -> columns answered instead of GENERIC
 
     def get(self, url, params=None, headers=None, timeout=None):
         if "/api/now/ui/meta/" in url:
-            self.meta_reads.append(url.rsplit("/", 1)[1])
-            return FakeResp(200, {"result": {"columns": dict(GENERIC)}})  # a copy, as a real response is
+            table = url.rsplit("/", 1)[1]
+            self.meta_reads.append(table)
+            # A copy, as a real response is.
+            return FakeResp(200, {"result": {"columns": dict(self.columns.get(table, GENERIC))}})
         self.gets.append((url, dict(params or {})))
         self.timeout = timeout
         if isinstance(self.resp, Exception):

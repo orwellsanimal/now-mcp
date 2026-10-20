@@ -23,8 +23,8 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 - `now-config` is read-only and offline.
 - `now-data` read verbs never mutate the instance.
 - `now_update`, `now_insert` and `now_run_script` default to `confirmed=False`, which returns a preview and writes nothing. Your agent or harness decides when `confirmed=True` is allowed. Gate it with a human approval step.
-- `now_update` never writes fields that don't exist on the record. It reports them under `unknown_fields`, because ServiceNow silently ignores writes to non-existent columns. `now_insert` refuses a confirmed insert that names one.
-- A confirmed `now_update` or `now_insert` reads the record back and reports what it holds, not what was sent. ServiceNow can accept a write and keep another value (a business rule, a data policy or an ACL does that without an error), so success is reported only for values that landed.
+- `now_update` never writes fields that don't exist on the record, because ServiceNow silently ignores writes to non-existent columns. It reports them under `unknown_fields`, and a confirmed update also lists them in `not_applied`, so its action isn't `"updated"`. A confirmed update with no field on the record is refused, and so is a confirmed `now_insert` that names one.
+- A confirmed `now_update` or `now_insert` reads the record back and reports what it holds, not what was sent. ServiceNow can accept a write and keep another value (a business rule, a data policy or an ACL does that without an error), so success is reported only for values that landed. A write that may have reached the instance but can't be confirmed raises `WriteUnconfirmed`: check the record before retrying, or a row or a work note may be duplicated.
 
 ## Development
 
