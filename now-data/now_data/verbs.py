@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Union
 
 from now_data.aggregate import sn_aggregate
 from now_data.client import get_client
@@ -38,12 +38,36 @@ def _split(csv: str | None) -> list[str]:
     return [f.strip() for f in csv.split(",") if f.strip()]
 
 
+# The read verbs' `display_value`: False = raw values and sys_ids, True = labels, "all" = both, as
+# `{"value": ..., "display_value": ...}` per field. servicenow-rio reads every field as "all"
+# (now-mcp#19), so it is a stated contract, not a pysnc accident.
+DisplayValue = Union[bool, Literal["all"]]
+
+
+def _display_value(display_value: Any) -> DisplayValue:
+    """The three stated values, and nothing else. pysnc 1.2.1's `_serialize` takes ANY string as
+    "both", so "false" or "true" would silently return pairs where the caller expects one value."""
+    if display_value is True or display_value is False:
+        return display_value
+    if isinstance(display_value, str) and display_value == "all":
+        return "all"
+    raise ValueError(f"display_value must be True, False or \"all\", got {display_value!r}.")
+
+
+def _fetch_both(gr: Any) -> None:
+    """Fetch values and labels both, without reference links (pysnc's defaults today, pinned here):
+    one read serves all three `display_value`s, and pysnc's "both" serialisation adds a `link` key
+    to any field that came back with one (now-mcp#20 review)."""
+    gr.display_value = "all"
+    gr.exclude_reference_link = True
+
+
 def now_query(
     table: str,
     query: str = "",
     fields: str = "",
     limit: int = DEFAULT_LIMIT,
-    display_value: bool = False,
+    display_value: DisplayValue = False,
 ) -> dict[str, Any]:
     """Query a ServiceNow table and return matching records.
 
@@ -52,19 +76,23 @@ def now_query(
     `limit` defaults to 50 and is hard-capped at 1000 to protect agent context —
     the response reports `truncated: true` when the cap was hit.
     `display_value=True` returns human-readable labels for reference/choice
-    fields instead of raw values/sys_ids.
+    fields instead of raw values/sys_ids. `display_value="all"` returns both:
+    every field is `{"value": ..., "display_value": ...}`, and `display_value`
+    is the value itself when the instance gives no label.
 
     Returns `{count, truncated, records: [...]}`. `count` is the number of
     records **returned** (at most `limit`), not the table total: when
     `truncated` is true there are more matches and the total is unknown. Use
     `now_aggregate` to count.
     """
+    display_value = _display_value(display_value)
     effective_limit = max(1, min(limit, MAX_LIMIT))
     field_list = _split(fields)
 
     client = get_client()
     check_request(client, check_table(table), query=query, fields={"fields": field_list})
     gr = client.GlideRecord(table)
+    _fetch_both(gr)
     if query:
         gr.add_encoded_query(query)
     if field_list:
@@ -86,19 +114,22 @@ def now_get(
     table: str,
     sys_id: str,
     fields: str = "",
-    display_value: bool = False,
+    display_value: DisplayValue = False,
 ) -> dict[str, Any]:
     """Fetch a single record by sys_id.
 
     `fields` is a comma-separated allow-list; empty returns every field.
     `display_value=True` returns human-readable labels for reference/choice
-    fields. Raises ValueError if no record with that sys_id exists — treat that
-    as a bad sys_id, not an empty result.
+    fields; `display_value="all"` returns `{"value": ..., "display_value": ...}`
+    per field, as `now_query` does. Raises ValueError if no record with that
+    sys_id exists — treat that as a bad sys_id, not an empty result.
     """
+    display_value = _display_value(display_value)
     field_list = _split(fields)
     client = get_client()
     check_request(client, check_table(table), fields={"fields": field_list})
     gr = client.GlideRecord(table)
+    _fetch_both(gr)
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "
