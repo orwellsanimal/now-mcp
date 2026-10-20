@@ -185,6 +185,102 @@ def test_get_missing_raises_value_error(client):
         verbs.now_get("incident", "nope")
 
 
+# ── display_value="all" is a stated contract (now-mcp#19) ────────────────────
+#
+# servicenow-rio reads every field as {value, display_value}. Pinned through the real verbs and the
+# installed pysnc over a canned transport, not FakeGR, whose serialize ignores display_value.
+
+SID, USER, GROUP = "a" * 32, "b" * 32, "c" * 32
+# One incident as the Table API answers it with sysparm_display_value=all and reference links
+# excluded. assignment_group comes back with an empty label.
+ROW = {"sys_id": {"value": SID, "display_value": SID},
+       "state": {"value": "2", "display_value": "In Progress"},
+       "assigned_to": {"value": USER, "display_value": "Beth Anglin"},
+       "assignment_group": {"value": GROUP, "display_value": ""}}
+FIELDS = "sys_id,state,assigned_to,assignment_group"
+
+
+@pytest.fixture
+def pysnc_instance(monkeypatch):
+    """A real pysnc ServiceNowClient whose transport answers UI Meta and the Table API from ROW, and
+    keeps every request it was sent."""
+    import requests
+    from pysnc import ServiceNowClient
+    from requests.adapters import BaseAdapter
+
+    sent = []
+
+    class Canned(BaseAdapter):
+        def send(self, request, **kwargs):
+            sent.append(request)
+            path = requests.utils.urlparse(request.url).path
+            if path.startswith("/api/now/ui/meta/"):
+                body = {"result": {"columns": GENERIC}}
+            elif path == f"/api/now/table/incident/{SID}":
+                body = {"result": ROW}
+            else:
+                body = {"result": [ROW]}
+            r = requests.Response()
+            r.status_code, r._content, r.encoding = 200, json.dumps(body).encode(), "utf-8"
+            r.headers["Content-Type"] = "application/json"
+            r.headers["X-Total-Count"] = "1"
+            r.request, r.url = request, request.url
+            return r
+
+        def close(self):
+            pass
+
+    sn = ServiceNowClient("https://example.service-now.com", ("user", "pw"))
+    sn.session.mount(sn.instance, Canned())
+    monkeypatch.setattr(verbs, "get_client", lambda: sn)
+    return sent
+
+
+def _table_requests(sent):
+    import requests
+    return [requests.utils.urlparse(r.url) for r in sent if "/api/now/table/" in r.url]
+
+
+def test_display_value_all_returns_value_and_label_per_field(pysnc_instance):
+    both = {"sys_id": {"value": SID, "display_value": SID},
+            "state": {"value": "2", "display_value": "In Progress"},
+            "assigned_to": {"value": USER, "display_value": "Beth Anglin"},
+            # No label from the instance: display_value is the value, not "".
+            "assignment_group": {"value": GROUP, "display_value": GROUP}}
+    assert verbs.now_query("incident", fields=FIELDS, display_value="all")["records"] == [both]
+    assert verbs.now_get("incident", SID, fields=FIELDS, display_value="all") == both
+
+
+def test_display_value_true_and_false_return_one_of_the_two(pysnc_instance):
+    raw = {"sys_id": SID, "state": "2", "assigned_to": USER, "assignment_group": GROUP}
+    labels = {"sys_id": SID, "state": "In Progress", "assigned_to": "Beth Anglin", "assignment_group": GROUP}
+    assert verbs.now_query("incident", fields=FIELDS)["records"] == [raw]
+    assert verbs.now_query("incident", fields=FIELDS, display_value=True)["records"] == [labels]
+    assert verbs.now_get("incident", SID, fields=FIELDS, display_value=False) == raw
+    assert verbs.now_get("incident", SID, fields=FIELDS, display_value=True) == labels
+
+
+@pytest.mark.parametrize("display_value", [False, True, "all"])
+def test_the_read_fetches_values_and_labels_whatever_is_asked(pysnc_instance, display_value):
+    # One fetch serves all three: the verb sets it rather than relying on pysnc's default.
+    from urllib.parse import parse_qs
+    verbs.now_query("incident", fields=FIELDS, display_value=display_value)
+    verbs.now_get("incident", SID, fields=FIELDS, display_value=display_value)
+    reads = _table_requests(pysnc_instance)
+    assert len(reads) == 2
+    assert all(parse_qs(u.query)["sysparm_display_value"] == ["all"] for u in reads)
+
+
+@pytest.mark.parametrize("bad", ["false", "true", "both", "", "ALL", 1, 0, None])
+def test_any_other_display_value_is_refused_before_a_request(pysnc_instance, bad):
+    # pysnc 1.2.1 serialises any string as both, so "false" would return pairs.
+    with pytest.raises(ValueError, match="display_value must be"):
+        verbs.now_query("incident", display_value=bad)
+    with pytest.raises(ValueError, match="display_value must be"):
+        verbs.now_get("incident", SID, display_value=bad)
+    assert pysnc_instance == []
+
+
 def test_update_previews_by_default_and_writes_only_when_confirmed(client):
     p = verbs.now_update("incident", "id1", {"state": "2", "short_description": "x1", "bogus": "y"})
     assert p["action"] == "preview"

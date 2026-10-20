@@ -12,7 +12,7 @@ Usable two ways:
 
 | Verb | Notes |
 |---|---|
-| `now_query(table, query="", fields="", limit=50, display_value=False)` | Returns `{count, truncated, records}`. `limit` is capped at 1000 and `truncated` is set without a second count call |
+| `now_query(table, query="", fields="", limit=50, display_value=False)` | Returns `{count, truncated, records}`. `limit` is capped at 1000 and `truncated` is set without a second count call. `display_value` is described below |
 | `now_get(table, sys_id, fields="", display_value=False)` | Raises `ValueError` on a missing sys_id |
 | `now_aggregate(table, query="", group_by="", count=True, sum_fields="", …)` | COUNT/SUM/AVG/MIN/MAX via the Stats API (see below) |
 | `now_update(table, sys_id, values, confirmed=False)` | **Dry run by default**: returns `changes` / `no_ops` / `unknown_fields` and writes nothing. Writes only with `confirmed=True`, then **reads back** (see below). Unknown fields are never written, because ServiceNow silently ignores writes to non-existent columns |
@@ -27,6 +27,18 @@ pip install "now-mcp-data @ git+https://github.com/orwellsanimal/now-mcp#subdire
 # with the MCP server
 pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp#subdirectory=now-data"
 ```
+
+**`display_value` on `now_query` and `now_get`.** It takes one of three values, and anything else raises `ValueError` before a request is sent:
+
+| `display_value` | Each field is |
+|---|---|
+| `False` (default) | the raw value: a sys_id for a reference, the stored value for a choice |
+| `True` | the label: a reference's display value, a choice's label |
+| `"all"` | both, as `{"value": ..., "display_value": ...}`. When the instance gives no label (an empty one, for instance), `display_value` is the value |
+
+The record is always fetched with `sysparm_display_value=all`, so all three come from the same read. servicenow-rio reads every field as `"all"`.
+
+> **Changed in 0.6.1.** `"all"` is a stated value, typed `bool | Literal["all"]`. Before, any string was passed to pysnc, which treats every string as "both", so `"false"` returned pairs. A string other than `"all"` now raises `ValueError` (now-mcp#19).
 
 **`now_aggregate` and PySNC.** It calls `GET /api/now/stats/{table}` over PySNC's authenticated session, so it works on released PySNC. It doesn't need `GlideAggregate` (ServiceNow/PySNC#146), which calls the same endpoint.
 
