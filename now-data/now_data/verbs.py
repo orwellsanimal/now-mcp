@@ -47,9 +47,19 @@ DisplayValue = Union[bool, Literal["all"]]
 def _display_value(display_value: Any) -> DisplayValue:
     """The three stated values, and nothing else. pysnc 1.2.1's `_serialize` takes ANY string as
     "both", so "false" or "true" would silently return pairs where the caller expects one value."""
-    if display_value is True or display_value is False or display_value == "all":
+    if display_value is True or display_value is False:
         return display_value
+    if isinstance(display_value, str) and display_value == "all":
+        return "all"
     raise ValueError(f"display_value must be True, False or \"all\", got {display_value!r}.")
+
+
+def _fetch_both(gr: Any) -> None:
+    """Fetch values and labels both, without reference links (pysnc's defaults today, pinned here):
+    one read serves all three `display_value`s, and pysnc's "both" serialisation adds a `link` key
+    to any field that came back with one (now-mcp#20 review)."""
+    gr.display_value = "all"
+    gr.exclude_reference_link = True
 
 
 def now_query(
@@ -82,8 +92,7 @@ def now_query(
     client = get_client()
     check_request(client, check_table(table), query=query, fields={"fields": field_list})
     gr = client.GlideRecord(table)
-    # Fetch values and labels both (pysnc's default today, pinned here): serialize picks per call.
-    gr.display_value = "all"
+    _fetch_both(gr)
     if query:
         gr.add_encoded_query(query)
     if field_list:
@@ -120,7 +129,7 @@ def now_get(
     client = get_client()
     check_request(client, check_table(table), fields={"fields": field_list})
     gr = client.GlideRecord(table)
-    gr.display_value = "all"
+    _fetch_both(gr)
     if not gr.get(sys_id):
         raise ValueError(
             f"No {table} record with sys_id {sys_id!r}. "

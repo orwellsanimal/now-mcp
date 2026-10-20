@@ -33,10 +33,12 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 | `display_value` | Each field is |
 |---|---|
 | `False` (default) | the raw value: a sys_id for a reference, the stored value for a choice |
-| `True` | the label: a reference's display value, a choice's label |
-| `"all"` | both, as `{"value": ..., "display_value": ...}`. When the instance gives no label (an empty one, for instance), `display_value` is the value |
+| `True` | the label: a reference's display value, a choice's label. A field with an empty label gives its value |
+| `"all"` | both, as `{"value": ..., "display_value": ...}` and nothing else. When the instance gives an empty label, `display_value` is the value |
 
-The record is always fetched with `sysparm_display_value=all`, so all three come from the same read. servicenow-rio reads every field as `"all"`.
+The record is always fetched with `sysparm_display_value=all` and `sysparm_exclude_reference_link=true`, so all three come from the same read, and no `link` key appears. servicenow-rio reads every field as `"all"`.
+
+Over MCP the tool schema (`boolean` or the constant `"all"`) is applied first. pydantic turns `"true"`, `"false"`, `"1"`, `"0"` and the like into a bool, so they reach the verb as `True` / `False`. Other strings fail the schema with a tool error, before the verb runs.
 
 > **Changed in 0.6.1.** `"all"` is a stated value, typed `bool | Literal["all"]`. Before, any string was passed to pysnc, which treats every string as "both", so `"false"` returned pairs. A string other than `"all"` now raises `ValueError` (now-mcp#19).
 

@@ -260,18 +260,35 @@ def test_display_value_true_and_false_return_one_of_the_two(pysnc_instance):
     assert verbs.now_get("incident", SID, fields=FIELDS, display_value=True) == labels
 
 
+@pytest.mark.parametrize("defaults", ["installed", "changed"])
 @pytest.mark.parametrize("display_value", [False, True, "all"])
-def test_the_read_fetches_values_and_labels_whatever_is_asked(pysnc_instance, display_value):
-    # One fetch serves all three: the verb sets it rather than relying on pysnc's default.
+def test_the_read_fetches_values_and_labels_whatever_is_asked(pysnc_instance, monkeypatch, display_value, defaults):
+    # One fetch serves all three: the verb sets it rather than relying on pysnc's default. Links stay
+    # out of it: pysnc's "both" serialisation adds a `link` key to any field that has one.
     from urllib.parse import parse_qs
+
+    from pysnc.record import GlideRecord
+    if defaults == "changed":  # a pysnc whose GlideRecord defaults are no longer "all" and no links
+        init = GlideRecord.__init__
+
+        def other_defaults(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            self.display_value, self.exclude_reference_link = False, False
+        monkeypatch.setattr(GlideRecord, "__init__", other_defaults)
     verbs.now_query("incident", fields=FIELDS, display_value=display_value)
     verbs.now_get("incident", SID, fields=FIELDS, display_value=display_value)
-    reads = _table_requests(pysnc_instance)
+    reads = [parse_qs(u.query) for u in _table_requests(pysnc_instance)]
     assert len(reads) == 2
-    assert all(parse_qs(u.query)["sysparm_display_value"] == ["all"] for u in reads)
+    assert all(q["sysparm_display_value"] == ["all"] for q in reads)
+    assert all(q["sysparm_exclude_reference_link"] == ["true"] for q in reads)
 
 
-@pytest.mark.parametrize("bad", ["false", "true", "both", "", "ALL", 1, 0, None])
+class _EqualsAnything:
+    def __eq__(self, other):
+        return True
+
+
+@pytest.mark.parametrize("bad", ["false", "true", "both", "", "ALL", "all ", 1, 0, None, _EqualsAnything()])
 def test_any_other_display_value_is_refused_before_a_request(pysnc_instance, bad):
     # pysnc 1.2.1 serialises any string as both, so "false" would return pairs.
     with pytest.raises(ValueError, match="display_value must be"):
