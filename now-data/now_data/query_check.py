@@ -237,9 +237,23 @@ def _problems(client: Any, table: str, query: str, fields: dict[str, list[str]],
         column = columns.get(name)
         if column is not None and value is not None:
             problem = _value_problem(name, column, "=", str(value), write=True)
+            if not problem and column.get("internal_type") == "boolean":
+                problem = _boolean_problem(name, value)
             if problem:
                 problems.append(f"values: {problem}")
     return problems
+
+
+def _boolean_problem(field: str, value: Any) -> str:
+    """Problem with writing `value` to a boolean field, else "".
+
+    Only true / false are taken. What the platform stores for "1", "yes" or "TRUE"
+    hasn't been measured, and the write's read-back would compare such a value as
+    text, so it is refused with the fix rather than sent (now-mcp#18 review).
+    """
+    if isinstance(value, bool) or str(value).strip() in ("true", "false"):
+        return ""
+    return f"{field} is a true/false field, so give it true or false, not {value!r}"
 
 
 def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]] | None = None,
@@ -249,7 +263,8 @@ def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]]
     `query` is an encoded query. `fields` maps a label for the message (e.g.
     "group_by") to field names that must exist. `values` are field -> value pairs
     to be written; a choice field must get a value it stores. Unknown fields in
-    `values` are left to the caller (now_update reports them itself).
+    `values` are left to the caller (now_update reads them off the record;
+    now_insert, which has no record, asks `unknown_fields`).
 
     Raises FieldsUnreadable when the table's fields can't be read: fail closed.
     """
@@ -265,3 +280,19 @@ def check(client: Any, table: str, query: str = "", fields: dict[str, list[str]]
             "this request would give a wrong or unchecked result, so nothing was run: "
             + "; ".join(problems) + "."
         )
+
+
+def unknown_fields(client: Any, table: str, names: Any) -> list[str]:
+    """The names in `names` that are not columns of `table`, sorted.
+
+    For a write with no record to read the fields off (now_insert). ServiceNow
+    silently drops a value for a column that doesn't exist, so these must be
+    reported, not sent. A name is reported only after the columns are re-read once:
+    the cache may predate a field added since, as in `check`.
+    """
+    names = list(names)
+    unknown = sorted(n for n in names if n not in table_columns(client, table))
+    if unknown:
+        _COLUMNS.pop((client.instance, table), None)
+        unknown = sorted(n for n in names if n not in table_columns(client, table))
+    return unknown

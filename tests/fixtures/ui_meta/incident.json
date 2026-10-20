@@ -1,0 +1,266 @@
+{
+  "assignment_group": {
+    "attributes": "encode_utf8=false,ref_contributions=on_call_escalation_tracking,tree_picker=false",
+    "base_type": "GUID",
+    "cangroup": true,
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": true,
+    "hint": "",
+    "internal_type": "reference",
+    "label": "Assignment group",
+    "mandatory": false,
+    "max_length": 32,
+    "max_unit": "days",
+    "name": "assignment_group",
+    "read_only": false,
+    "reference": "sys_user_group",
+    "reference_attributes": {
+      "display_field": "name",
+      "ref_ac_columns": [],
+      "ref_ac_columns_search": "",
+      "ref_ac_display_value": true,
+      "ref_auto_completer": ""
+    },
+    "reference_display_field": "name",
+    "type": "reference"
+  },
+  "close_notes": {
+    "attributes": "edge_encryption_enabled=true",
+    "base_type": "string",
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": true,
+    "hint": "",
+    "internal_type": "string",
+    "label": "Resolution notes",
+    "mandatory": false,
+    "max_length": 4000,
+    "max_unit": "days",
+    "multitext": true,
+    "name": "close_notes",
+    "read_only": false,
+    "type": "string"
+  },
+  "comments": {
+    "attributes": "edge_encryption_enabled=true",
+    "base_type": "string",
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": false,
+    "hint": "Journaled field, shared with the end user",
+    "internal_type": "journal_input",
+    "label": "Comments",
+    "mandatory": false,
+    "max_length": 4000,
+    "max_unit": "days",
+    "multitext": true,
+    "name": "comments",
+    "read_only": false,
+    "type": "journal_input"
+  },
+  "opened_at": {
+    "attributes": "edge_encryption_enabled=true,sla_basis=incident,timeDimension=true",
+    "base_type": "datetime",
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": true,
+    "hint": "",
+    "internal_type": "glide_date_time",
+    "label": "Opened",
+    "mandatory": false,
+    "max_length": 40,
+    "max_unit": "days",
+    "name": "opened_at",
+    "read_only": false,
+    "type": "glide_date_time"
+  },
+  "short_description": {
+    "attributes": "edge_encryption_enabled=true,knowledge_search=true,no_truncate=true,ts_weight=10",
+    "base_type": "string",
+    "cangroup": true,
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": true,
+    "hint": "",
+    "internal_type": "string",
+    "label": "Short description",
+    "mandatory": false,
+    "max_length": 160,
+    "max_unit": "days",
+    "name": "short_description",
+    "read_only": false,
+    "type": "string"
+  },
+  "state": {
+    "attributes": "close_states=7;8,default_close_state=7,default_work_state=2,ignore_filter_on_new=true,timeFromCreateToActivate=24000",
+    "base_type": "string",
+    "cangroup": true,
+    "canmatch": true,
+    "cansort": true,
+    "choice_type": 3,
+    "choices": [
+      {
+        "image": "",
+        "label": "New",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "New"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "New",
+        "reference": false,
+        "selected": false,
+        "sequence": 1,
+        "used": false,
+        "value": "1"
+      },
+      {
+        "image": "",
+        "label": "In Progress",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "In Progress"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "In Progress",
+        "reference": false,
+        "selected": false,
+        "sequence": 2,
+        "used": false,
+        "value": "2"
+      },
+      {
+        "image": "",
+        "label": "On Hold",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "On Hold"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "On Hold",
+        "reference": false,
+        "selected": false,
+        "sequence": 3,
+        "used": false,
+        "value": "3"
+      },
+      {
+        "image": "",
+        "label": "Resolved",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "Resolved"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "Resolved",
+        "reference": false,
+        "selected": false,
+        "sequence": 6,
+        "used": false,
+        "value": "6"
+      },
+      {
+        "image": "",
+        "label": "Closed",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "Closed"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "Closed",
+        "reference": false,
+        "selected": false,
+        "sequence": 7,
+        "used": false,
+        "value": "7"
+      },
+      {
+        "image": "",
+        "label": "Canceled",
+        "missing": false,
+        "parameters": {
+          "dependent_values": [
+            ""
+          ],
+          "dependent_values_map": {
+            "": "Canceled"
+          },
+          "name": "incident"
+        },
+        "rawLabel": "Canceled",
+        "reference": false,
+        "selected": false,
+        "sequence": 8,
+        "used": false,
+        "value": "8"
+      }
+    ],
+    "column_type": "element",
+    "default": "",
+    "filterable": true,
+    "hint": "",
+    "internal_type": "integer",
+    "label": "State",
+    "mandatory": false,
+    "max_length": 40,
+    "max_unit": "days",
+    "name": "state",
+    "read_only": false,
+    "type": "choice"
+  },
+  "work_notes": {
+    "attributes": "edge_encryption_enabled=true",
+    "base_type": "string",
+    "canmatch": true,
+    "cansort": true,
+    "column_type": "element",
+    "default": "",
+    "filterable": false,
+    "hint": "",
+    "internal_type": "journal_input",
+    "label": "Work notes",
+    "mandatory": false,
+    "max_length": 4000,
+    "max_unit": "days",
+    "multitext": true,
+    "name": "work_notes",
+    "read_only": false,
+    "type": "journal_input"
+  }
+}
