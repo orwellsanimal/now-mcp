@@ -19,7 +19,7 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(change.FLAG, raising=False)
     monkeypatch.delenv(change.GUARD_URI, raising=False)
-    monkeypatch.setattr(change, "_guard_base", None)
+    monkeypatch.setattr(change, "_discovered", {})
 
 
 class Fake:
@@ -230,7 +230,7 @@ def test_the_guard_is_found_by_name_and_service_id():
 def test_the_guard_uri_setting_wins_and_is_checked(monkeypatch):
     monkeypatch.setenv(change.GUARD_URI, "/api/x_acme_chg/guard")
     assert change._guard_url(GuardClient([])) == "https://example.service-now.com/api/x_acme_chg/guard"
-    monkeypatch.setattr(change, "_guard_base", None)
+    monkeypatch.setattr(change, "_discovered", {})
     monkeypatch.setenv(change.GUARD_URI, "https://evil.example/api/x/guard")
     with pytest.raises(ValueError, match="not a REST base path"):
         change._guard_url(GuardClient([]))
@@ -261,3 +261,14 @@ def test_no_instance_names_in_the_module():
     src = Path(change.__file__).read_text(encoding="utf-8")
     assert set(re.findall(r"\bx_[a-z0-9]+_[a-z0-9_]+", src)) <= {"x_acme_chg"}
     assert not re.search(r"\bdev[0-9]{4,}\b", src)
+
+
+def test_a_found_guard_is_remembered_per_instance(monkeypatch):
+    # client.configure() can point the verbs at a second instance with its own scope.
+    one = GuardClient([{"name": "Agent Change Guard", "service_id": "guard", "base_uri": "/api/x_one_chg/guard"}])
+    two = GuardClient([{"name": "Agent Change Guard", "service_id": "guard", "base_uri": "/api/x_two_chg/guard"}])
+    two.instance = "https://other.service-now.com"
+    assert change._guard_url(one).endswith("/api/x_one_chg/guard")
+    assert change._guard_url(two) == "https://other.service-now.com/api/x_two_chg/guard"
+    one.rows = []  # found once: not read again for the same instance
+    assert change._guard_url(one).endswith("/api/x_one_chg/guard")

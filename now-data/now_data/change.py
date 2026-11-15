@@ -90,27 +90,29 @@ def _require_enabled() -> None:
         )
 
 
-_guard_base: str | None = None
+# Base paths found through sys_ws_definition, per instance: client.configure() can
+# point the verbs at another instance, whose guard may sit under another scope.
+_discovered: dict[str, str] = {}
 
 
 def _guard_url(client: Any) -> str:
-    """The guard API's absolute base URL (cached for the process).
+    """The guard API's absolute base URL.
 
     NOW_CHANGE_GUARD_URI (e.g. `/api/x_acme_chg/guard`) wins. Without it the URI is
     read from sys_ws_definition, which an ordinary agent account (itil) may not read:
     measured on a PDI, 2026-11-15, an itil account got 403 on it.
     """
-    global _guard_base
-    if _guard_base is None:
-        load_dotenv(find_dotenv(usecwd=True))
-        given = os.getenv(GUARD_URI, "").strip()
-        if given:
-            if not re.fullmatch(r"/api/[a-z0-9_]+/[a-z0-9_]+", given):
-                raise ValueError(f"{GUARD_URI}={given!r} is not a REST base path like /api/x_acme_chg/guard.")
-            _guard_base = given
-        else:
-            _guard_base = _discover_guard(client)
-    return client.instance.rstrip("/") + _guard_base
+    load_dotenv(find_dotenv(usecwd=True))
+    given = os.getenv(GUARD_URI, "").strip()
+    if given:
+        if not re.fullmatch(r"/api/[a-z0-9_]+/[a-z0-9_]+", given):
+            raise ValueError(f"{GUARD_URI}={given!r} is not a REST base path like /api/x_acme_chg/guard.")
+        base = given
+    else:
+        base = _discovered.get(client.instance)
+        if base is None:
+            base = _discovered[client.instance] = _discover_guard(client)
+    return client.instance.rstrip("/") + base
 
 
 def _discover_guard(client: Any) -> str:
