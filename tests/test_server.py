@@ -36,5 +36,8 @@ def test_change_server_offers_nothing_unless_enabled(monkeypatch, tmp_path):
     monkeypatch.delenv(change.FLAG, raising=False)
     assert asyncio.run(change_server.build_server().list_tools()) == []
     monkeypatch.setenv(change.FLAG, "1")
-    tools = asyncio.run(change_server.build_server().list_tools())
+    server = change_server.build_server()
+    tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == set(change.__all__)
+    # An MCP client hands the guide to the agent as the server's instructions.
+    assert server.instructions == change.AGENT_GUIDE

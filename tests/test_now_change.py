@@ -26,9 +26,10 @@ class Fake:
     """The guard's answers and the now-data verbs the change verbs call, recorded."""
 
     def __init__(self):
-        self.allowed, self.reasons = True, []
-        self.checks, self.inserts, self.updates = [], [], []
-        self.write_error = None
+        self.governed, self.allowed, self.reasons = True, True, []
+        self.checks, self.inserts, self.updates, self.queries = [], [], [], []
+        # write_error: raised by the write. lookup_error: raised by any query once something was written.
+        self.write_error = self.lookup_error = None
         self.rows = {
             "chg_model": [{"sys_id": STANDARD, "name": "Standard"}, {"sys_id": NORMAL, "name": "Normal"}],
             "std_change_record_producer": [{"sys_id": PRODUCER, "name": "Reboot", "current_version": VERSION,
@@ -40,9 +41,12 @@ class Fake:
         if path == "/policy":
             return {"governed": True, "active": True, "allowed_cis": [{"sys_id": CI}]}
         self.checks.append(body)
-        return {"governed": True, "allowed": self.allowed, "reasons": list(self.reasons)}
+        return {"governed": self.governed, "allowed": self.allowed, "reasons": list(self.reasons)}
 
     def now_query(self, table, query="", fields="", limit=50, display_value=False):
+        self.queries.append((table, query))
+        if self.lookup_error and (self.inserts or self.updates):
+            raise self.lookup_error
         terms = [t.split("=", 1) for t in query.split("^") if "=" in t and not t.startswith("ORDERBY")]
         rows = [r for r in self.rows.get(table, [])
                 if all(k == "active" or str(r.get(k)) == v for k, v in terms)]
@@ -75,6 +79,7 @@ def fake(monkeypatch):
 # ── the flag ──────────────────────────────────────────────────────────────────
 
 CALLS = {
+    "now_change_guide": {},
     "now_change_policy": {},
     "now_change_get": {"change": "CHG0000123"},
     "now_change_preview": {"values": {"state": "-4"}},
@@ -109,10 +114,18 @@ def test_flag_values(monkeypatch, value, on):
     assert change.enabled() is on
 
 
-def test_flag_from_dotenv(tmp_path):
+def test_a_dotenv_never_turns_the_verbs_on(tmp_path, monkeypatch):
+    # A .env in the working directory or above it (a cloned repo's) must not switch writes on (PR #23 review).
+    work = tmp_path / "repo" / "sub"
+    work.mkdir(parents=True)
+    for d in (tmp_path / "repo", work):
+        Path(d, ".env").write_text(f"{change.FLAG}=1\n{change.GUARD_URI}=/api/x_evil/guard\n", encoding="utf-8")
+    monkeypatch.chdir(work)
     assert change.enabled() is False
-    Path(tmp_path, ".env").write_text(f"{change.FLAG}=1\n", encoding="utf-8")
-    assert change.enabled() is True
+    with pytest.raises(change.ChangeVerbsDisabled):
+        change.now_change_policy()
+    import os
+    assert change.FLAG not in os.environ and change.GUARD_URI not in os.environ
 
 
 # ── writes ask the guard first ────────────────────────────────────────────────
@@ -170,6 +183,100 @@ def test_a_401_is_not_taken_for_a_refusal(fake):
     fake.write_error = px.AuthenticationException("401")
     with pytest.raises(px.AuthenticationException):
         change.now_change_move("CHG0000123", "assess", confirmed=True)
+
+
+# ── PR #23 review ─────────────────────────────────────────────────────────────
+
+ACL_403 = px.RoleException({"error": {"message": "Operation Failed",
+                                      "detail": "ACL Exception Update Failed due to security constraints"},
+                            "status": "failure"})
+
+
+def test_an_acl_403_says_no_access_and_no_retry(fake):
+    fake.write_error = ACL_403
+    r = change.now_change_move("CHG0000123", "assess", confirmed=True)
+    assert r["action"] == "refused_by_instance" and "security constraints" in r["detail"]
+    assert "won't help" in r["note"] and "assignment_group" not in r["note"]
+
+
+def test_a_recheck_that_refuses_without_reasons_is_still_the_guards_refusal(fake, monkeypatch):
+    answers = iter([{"governed": True, "allowed": True, "reasons": []},
+                    {"governed": True, "allowed": False, "reasons": []}])
+    monkeypatch.setattr(change, "_guard", lambda m, p, b=None: next(answers))
+    fake.write_error = ACL_403
+    assert change.now_change_move("CHG0000123", "assess", confirmed=True)["action"] == "refused"
+
+
+def test_a_recheck_that_fails_keeps_the_403s_detail(fake, monkeypatch):
+    calls = []
+
+    def guard(m, p, b=None):
+        calls.append(p)
+        if len(calls) > 1:
+            raise RuntimeError("The change guard answered HTTP 500")
+        return {"governed": True, "allowed": True, "reasons": []}
+
+    monkeypatch.setattr(change, "_guard", guard)
+    fake.write_error = ACL_403
+    r = change.now_change_move("CHG0000123", "assess", confirmed=True)
+    assert r["action"] == "refused_by_instance" and "security constraints" in r["detail"]
+
+
+def test_a_write_that_landed_is_named_even_when_the_lookup_fails(fake):
+    # A raise here would invite a retry, and a retried create opens a second change.
+    fake.lookup_error = ConnectionError("reset by peer")
+    r = change.now_change_create_normal(CI, "s", "j", "i", "b", "t", confirmed=True)
+    assert len(fake.inserts) == 1
+    assert r["sys_id"] == "1" * 32 and r["number"] is None and r["state"] is None
+    assert "Don't repeat the write" in r["note"]
+
+
+def test_an_ungoverned_account_gets_no_writes(fake):
+    # The guard allows everything for an account it doesn't govern.
+    fake.governed = False
+    p = change.now_change_create_standard("Reboot", CI)
+    assert p["allowed"] is False and p["reasons"][0] == change.NOT_GOVERNED
+    r = change.now_change_create_standard("Reboot", CI, confirmed=True)
+    assert r["action"] == "refused" and fake.inserts == []
+    assert change.now_change_preview({"state": "-4"})["allowed"] is False
+
+
+@pytest.mark.parametrize("value", ["false", "true", 1, None])
+def test_only_a_json_true_allows(fake, value):
+    fake.allowed = value
+    assert change.now_change_create_standard("Reboot", CI)["allowed"] is False
+    change.now_change_create_standard("Reboot", CI, confirmed=True)
+    assert fake.inserts == []
+
+
+@pytest.mark.parametrize("template", ["zzz^ORnameISNOTEMPTY", "Reboot^NQname=x", "Reboot\nx", "  "])
+def test_a_template_name_cannot_carry_query_terms(fake, template):
+    with pytest.raises(ValueError, match="not a template name"):
+        change.now_change_create_standard(template, CI)
+    assert not any(t == "std_change_record_producer" for t, _ in fake.queries)
+
+
+def test_a_template_name_resolves_the_same_way_every_time(fake):
+    change.now_change_create_standard("Reboot", CI)
+    queries = [q for t, q in fake.queries if t == "std_change_record_producer"]
+    assert queries == ["name=Reboot^active=true^ORDERBYsys_created_on"]
+
+
+# ── the agent guide ───────────────────────────────────────────────────────────
+
+def test_the_guide_names_every_tool():
+    for name in change.__all__:
+        if name != "now_change_guide":
+            assert name in change.AGENT_GUIDE, name
+
+
+def test_the_readme_carries_the_guide_word_for_word():
+    readme = (Path(change.__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert change.AGENT_GUIDE.strip() in readme.replace("\r\n", "\n")
+
+
+def test_the_guide_verb_returns_the_guide(fake):
+    assert change.now_change_guide() == change.AGENT_GUIDE
 
 
 def test_move_maps_states_and_passes_the_window(fake):
