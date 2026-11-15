@@ -151,6 +151,146 @@ verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # write
 verbs.now_insert("label", {"name": "Router"})                            # inserts nothing
 ```
 
+## Change verbs (`now-mcp-change`), off by default
+
+Change-request verbs for AI-agent accounts, in `now_data.change`, with their own MCP server, `now-mcp-change`. The verbs are **off** unless `NOW_CHANGE_ENABLED=1` is set in the **process environment**. A `.env` file never turns them on: one at or above the working directory (often a repository an agent cloned) must not switch writes on against credentials it didn't supply. When they're off, every verb raises `ChangeVerbsDisabled`, and the server starts with no tools at all.
+
+The verbs don't decide what an agent may do. The instance's **change guard** does: a Scripted REST API named "Agent Change Guard" (`service_id` `guard`) with `GET <base>/policy` and `POST <base>/check`, backed by business rules that refuse writes outside the account's policy. Every write is checked with the guard first, and a refusal comes back as `action: "refused"` with the guard's `reasons`. That matters because a refused Table API write is a bare 403. The rules hold however the account reaches the instance, these verbs or not.
+
+| Verb | Notes |
+|---|---|
+| `now_change_guide()` | The agent guide below, as text. Read it before the first change |
+| `now_change_policy()` | What this account may do: `governed`, `active`, `allow_normal`, `allowed_cis`, `allowed_templates`. Read it first |
+| `now_change_get(change)` | One change by number or sys_id, with `state` by name and its `approvals` |
+| `now_change_preview(values, change="")` | `{governed, allowed, reasons}` for a write, without writing |
+| `now_change_create_standard(template, cmdb_ci, short_description="", assignment_group="", confirmed=False)` | A Standard change from a template in the policy (sys_id or exact name). The guard fills its plans from the template |
+| `now_change_create_normal(cmdb_ci, short_description, justification, implementation_plan, backout_plan, test_plan, assignment_group="", confirmed=False)` | A Normal change, which a person approves |
+| `now_change_move(change, to, start_date="", end_date="", close_code="", close_notes="", confirmed=False)` | `to` is new, assess, authorize, scheduled, implement, review, closed or canceled. The planned window is needed to leave New |
+
+**What a write returns:**
+
+| `action` | Meaning |
+|---|---|
+| `preview` | A dry run (`confirmed=False`, the default): the guard's `allowed` and `reasons`. Nothing written |
+| `refused` | The guard says no, and `reasons` say why. Nothing written |
+| `refused_by_instance` | The guard allowed it, but the instance aborted it, so nothing was written. `detail` is the instance's own message. `note` tells a business rule (often a change-model transition condition: leaving New needs `assignment_group`), which can be fixed, from no access (an ACL), which a retry won't fix |
+| `inserted` / `updated` (and their `_with_differences` forms) | A confirmed write, read back through `now_insert` / `now_update`, with the change's `number` and `state`. If the write happened but that lookup failed, `number` and `state` are `None`, and `note` says not to repeat it |
+
+**An account the guard doesn't govern gets no writes.** For a user who isn't an AI agent and has no policy row, the guard allows everything. So the verbs refuse every write for an account it doesn't govern (`governed: false`), and the reason tells an admin to give the account a policy first.
+
+### Setting it up for an agent
+
+The agent needs its **own** ServiceNow account, which the guard governs: a row in the guard's policy table, and `identity_type` `ai_agent`. It also needs an approval group it isn't a member of. `SN_INSTANCE`, `SN_USER` and `SN_PASSWORD` come from the environment or a `.env`, as for every now-data verb. The two change settings come only from the process environment:
+
+| Setting | |
+|---|---|
+| `NOW_CHANGE_ENABLED` | `1`, `true` or `yes` turns the verbs on |
+| `NOW_CHANGE_GUARD_URI` | The guard's base path, e.g. `/api/x_acme_chg/guard`. Without it, the verbs read it from `sys_ws_definition`, which an ordinary agent account (itil) usually can't read: on a PDI on 2026-11-15, itil got a 403. An admin finds the path on the Scripted REST API record (Base API path). It's used for whichever instance is configured, so a caller that switches instances must change or unset it |
+
+The usual place for both is the MCP server's `env` block:
+
+```json
+{
+  "mcpServers": {
+    "now-change": {
+      "command": "now-mcp-change",
+      "env": { "NOW_CHANGE_ENABLED": "1", "NOW_CHANGE_GUARD_URI": "/api/x_acme_chg/guard" }
+    }
+  }
+}
+```
+
+The server sends the agent guide as its MCP instructions. `now_change_guide` returns the same text for clients that don't pass instructions to the model. As a library:
+
+```python
+from now_data import change
+
+print(change.AGENT_GUIDE)
+change.now_change_policy()
+change.now_change_create_standard("Reboot Windows Server", ci_sys_id, assignment_group=group_sys_id)  # dry run
+change.now_change_move("CHG0030211", "scheduled", start_date="2026-11-16 10:00:00",
+                       end_date="2026-11-16 12:00:00", confirmed=True)
+```
+
+### The agent guide
+
+This is what an agent receives, word for word (`change.AGENT_GUIDE`; a test keeps the two equal):
+
+```text
+# Working with changes through now-change
+
+The instance's change guard decides what this account may do. These tools ask it
+before every write and pass its reasons back. Every write is a dry run unless
+confirmed=true: read the dry run's `allowed` and `reasons` before confirming.
+
+## Before anything
+
+1. Call now_change_policy. `governed` must be true and `active` true. If not, stop:
+   an admin has to give this account a policy, and no write will be allowed.
+2. Note `allowed_cis` (every change needs one), `allowed_templates` (Standard
+   changes) and `allow_normal` (whether you may open Normal changes).
+3. Choose an assignment group you are NOT a member of. The stock change models need
+   one to leave New, and on a Normal change its members are asked to approve.
+4. Unsure whether something is allowed? now_change_preview(values, change) asks the
+   guard about any write without making it.
+
+## Happy path: Standard change (pre-approved template, no approval wait)
+
+1. now_change_create_standard(template, cmdb_ci, assignment_group=...): dry run,
+   then again with confirmed=true. Keep the returned `number`. The guard fills the
+   plans from the template, so you don't give any.
+2. now_change_move(number, "scheduled", start_date=..., end_date=...): the planned
+   window, "YYYY-MM-DD HH:MM:SS" in UTC. It must cover the whole job and can't be
+   changed after the change leaves New.
+3. When the window has opened: now_change_move(number, "implement"). Then do the work,
+   following the template's implementation plan.
+4. now_change_move(number, "review"), then now_change_move(number, "closed",
+   close_code=..., close_notes=...). close_code is successful, successful_issues or
+   unsuccessful. close_notes says what was done and what was checked.
+
+## Happy path: Normal change (a person approves)
+
+1. now_change_create_normal(cmdb_ci, short_description, justification,
+   implementation_plan, backout_plan, test_plan, assignment_group=...): dry run,
+   then confirmed=true. Every plan is required. Write them for the person approving.
+2. now_change_move(number, "assess", start_date=..., end_date=...). The change's
+   flows now ask the assignment group to approve, then CAB. They move the change to
+   Authorize and then Scheduled once people approve. You don't move it past Assess.
+3. Wait. Check with now_change_get(number): `state` and `approvals` show what it is
+   waiting for. Check now and then; don't poll in a tight loop.
+4. Once `state` is scheduled and the window has opened, carry on as from step 3 of
+   the Standard path.
+
+## When something goes wrong
+
+- action "refused": the guard said no. `reasons` say why. Fix what they name. A
+  repeat of the same call gets the same answer.
+- action "refused_by_instance": the guard allowed it, but the instance didn't.
+  `note` says which kind: a business rule (often a change-model transition
+  condition, e.g. no assignment group), which you can fix; or no access, which you
+  can't: stop and ask a person.
+- A write that raised WriteUnconfirmed, or came back with number None: it may
+  have happened. Check with now_change_get, or look for your change, before trying
+  again; a blind retry can open a second change.
+- The work failed: back it out with the backout plan, then close with
+  close_code=unsuccessful and say what happened in close_notes.
+- The window passed before you could start, or the change was rejected: cancel it
+  (now_change_move(number, "canceled")) and open a new one if the work is still needed.
+
+## Never
+
+- Never write change_request, sysapproval_approver or sysapproval_group with the
+  raw Table API or a script (now_update, now_insert, now_run_script). Use these
+  tools. The guard holds those writes to the same rules, but its refusals come
+  back as a bare 403 with no reasons, and nothing checks the write first.
+- Never approve, reject or edit an approval, and never make yourself an approver.
+- Never open an Emergency change. It is always refused.
+- Never try to edit a Standard change's plans, swap its template, change its CI or
+  move its window after New, reopen a Canceled or Closed change, or delete a change.
+- Never start Implement outside the planned window.
+- Never confirm a write you haven't seen the dry run of.
+```
+
 ## Exporting a snapshot for now-config
 
 now-config answers from an instance-config snapshot. This writes one from the instance in `SN_INSTANCE`, with nothing but this package. You don't need Node or servicenow-coder's exporter.

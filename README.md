@@ -5,13 +5,13 @@ ServiceNow verbs for AI agents and scripts, packaged two ways: as plain Python f
 | Package | What it answers | Needs |
 |---|---|---|
 | [`now-config`](now-config/README.md) | "Does this table/field/choice/role/property exist?", from an exported **instance-config snapshot** | nothing (stdlib) |
-| [`now-data`](now-data/README.md) | "What's on the instance right now?": query, get, aggregate, plus **gated** writes (`confirmed=False` is a dry run), and `now-mcp-export`, which writes the snapshot now-config reads | `pysnc`, `python-dotenv`, credentials |
+| [`now-data`](now-data/README.md) | "What's on the instance right now?": query, get, aggregate, plus **gated** writes (`confirmed=False` is a dry run), `now-mcp-export`, which writes the snapshot now-config reads, and the change verbs (`now-mcp-change`, **off by default**), which ask the instance's change guard before every write | `pysnc`, `python-dotenv`, credentials |
 
 ## Library first, MCP optional
 
 The verbs live in `now_config.verbs` and `now_data.verbs`. They import nothing from the MCP SDK, so the core installs are **pure Python**. That matters on locked-down machines (e.g. Windows App Control for Business), where unsigned compiled extensions such as `pydantic-core` may be blocked. CI checks this contract (`tests/test_import_safety.py`).
 
-The MCP servers (`now-mcp-config`, `now-mcp-data`) are a thin layer over the same functions. You install them with the `server` extra.
+The MCP servers (`now-mcp-config`, `now-mcp-data`, `now-mcp-change`) are a thin layer over the same functions. You install them with the `server` extra.
 
 ```bash
 pip install "now-mcp-data @ git+https://github.com/orwellsanimal/now-mcp#subdirectory=now-data"            # library
@@ -22,6 +22,7 @@ pip install "now-mcp-data[server] @ git+https://github.com/orwellsanimal/now-mcp
 
 - `now-config` is read-only and offline.
 - `now-data` read verbs never mutate the instance.
+- The change verbs (`now_data.change`, server `now-mcp-change`) are off unless `NOW_CHANGE_ENABLED=1` is set in the process environment (a `.env` never turns them on). They write nothing for an account the guard doesn't govern. Their writes are dry runs unless `confirmed=True` too, and each one is checked with the instance's change guard first. The guard, not the verbs, decides what an agent account may do.
 - `now_update`, `now_insert` and `now_run_script` default to `confirmed=False`, which returns a preview and writes nothing. Your agent or harness decides when `confirmed=True` is allowed. Gate it with a human approval step.
 - `now_update` never writes fields that don't exist on the record, because ServiceNow silently ignores writes to non-existent columns. It reports them under `unknown_fields`, and a confirmed update also lists them in `not_applied`, so its action isn't `"updated"`. A confirmed update with no field on the record is refused, and so is a confirmed `now_insert` that names one.
 - A confirmed `now_update` or `now_insert` reads the record back and reports what it holds, not what was sent. ServiceNow can accept a write and keep another value (a business rule, a data policy or an ACL does that without an error), so success is reported only for values that landed. A write that may have reached the instance but can't be confirmed raises `WriteUnconfirmed`: check the record before retrying, or a row or a work note may be duplicated.
