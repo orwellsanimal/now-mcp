@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "now-mcp-data"
-version = "0.6.1"
+version = "0.7.0"
 description = "Live-instance ServiceNow verbs over PySNC (query, get, aggregate, gated writes), as a library and an MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,8 @@ server = ["mcp>=1.0,<2"]
 [project.scripts]
 now-mcp-data = "now_data.server:main"
 now-mcp-export = "now_data.export:main"
+# Off unless NOW_CHANGE_ENABLED=1 (now-mcp#22).
+now-mcp-change = "now_data.change_server:main"
 
 [project.urls]
 Repository = "https://github.com/orwellsanimal/now-mcp"

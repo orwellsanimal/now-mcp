@@ -151,6 +151,43 @@ verbs.now_update("incident", sys_id, {"state": "2"}, confirmed=True)     # write
 verbs.now_insert("label", {"name": "Router"})                            # inserts nothing
 ```
 
+## Change verbs (`now-mcp-change`), off by default
+
+Change-request verbs for AI-agent accounts, in `now_data.change`, with their own MCP server, `now-mcp-change`. The verbs are **off** unless `NOW_CHANGE_ENABLED=1` is set in the environment or the nearest `.env`. When it's off, every verb raises `ChangeVerbsDisabled`, and the server starts with no tools at all.
+
+The verbs don't decide what an agent may do. The instance's **change guard** does: a Scripted REST API named "Agent Change Guard" (`service_id` `guard`) with `GET <base>/policy` and `POST <base>/check`, backed by business rules that refuse writes outside the account's policy. Every write is checked with the guard first, and a refusal comes back as `action: "refused"` with the guard's `reasons`. That matters because a refused Table API write is a bare 403.
+
+| Verb | Notes |
+|---|---|
+| `now_change_policy()` | What this account may do: `governed`, `active`, `allow_normal`, `allowed_cis`, `allowed_templates`. Read it first |
+| `now_change_get(change)` | One change by number or sys_id, with `state` by name and its `approvals` |
+| `now_change_preview(values, change="")` | `{governed, allowed, reasons}` for a write, without writing |
+| `now_change_create_standard(template, cmdb_ci, short_description="", assignment_group="", confirmed=False)` | A Standard change from a template in the policy. The guard fills its plans from the template |
+| `now_change_create_normal(cmdb_ci, short_description, justification, implementation_plan, backout_plan, test_plan, assignment_group="", confirmed=False)` | A Normal change, which a person approves |
+| `now_change_move(change, to, start_date="", end_date="", close_code="", close_notes="", confirmed=False)` | `to` is new, assess, authorize, scheduled, implement, review, closed or canceled. The planned window is needed to leave New |
+
+Every write is a **dry run** unless `confirmed=True`. A dry run returns the guard's answer (`action: "preview"`, `allowed`, `reasons`). A confirmed write goes through `now_insert` or `now_update`, so it's read back. It also returns the change's `number` and `state`. When the guard allows a write but a stock rule aborts it, the result is `action: "refused_by_instance"`, and `detail` names the rule. One such rule is the change model's state transition conditions: leaving New needs `assignment_group`.
+
+**Settings** (environment or `.env`):
+
+| Setting | |
+|---|---|
+| `NOW_CHANGE_ENABLED` | `1`, `true` or `yes` turns the verbs on |
+| `NOW_CHANGE_GUARD_URI` | The guard's base path, e.g. `/api/x_acme_chg/guard`. Without it, the verbs read it from `sys_ws_definition`, which an ordinary agent account (itil) usually can't read. On a PDI on 2026-11-15, itil got a 403. An admin finds the path on the Scripted REST API record (Base API path) |
+
+```bash
+NOW_CHANGE_ENABLED=1 NOW_CHANGE_GUARD_URI=/api/x_acme_chg/guard now-mcp-change   # MCP server
+```
+
+```python
+from now_data import change
+
+change.now_change_policy()
+change.now_change_create_standard("Reboot Windows Server", ci_sys_id, assignment_group=group_sys_id)  # dry run
+change.now_change_move("CHG0030211", "scheduled", start_date="2026-11-16 10:00:00",
+                       end_date="2026-11-16 12:00:00", confirmed=True)
+```
+
 ## Exporting a snapshot for now-config
 
 now-config answers from an instance-config snapshot. This writes one from the instance in `SN_INSTANCE`, with nothing but this package. You don't need Node or servicenow-coder's exporter.

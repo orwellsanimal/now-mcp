@@ -10,7 +10,7 @@ import sys
 
 PROBE = """
 import sys
-import now_config.verbs, now_data.verbs
+import now_config.verbs, now_data.verbs, now_data.change
 bad = sorted(m for m in sys.modules
              if m == "mcp" or m.startswith(("mcp.", "pydantic", "pysnc")))
 print(",".join(bad))

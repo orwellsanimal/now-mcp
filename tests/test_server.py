@@ -27,3 +27,14 @@ def test_the_read_tools_offer_display_value_all(tool):
     schema = tools[tool].inputSchema["properties"]["display_value"]
     assert {"type": "boolean"} in schema["anyOf"]
     assert any(s.get("const") == "all" or s.get("enum") == ["all"] for s in schema["anyOf"])
+
+
+def test_change_server_offers_nothing_unless_enabled(monkeypatch, tmp_path):
+    from now_data import change, change_server
+
+    monkeypatch.chdir(tmp_path)  # no .env from the checkout
+    monkeypatch.delenv(change.FLAG, raising=False)
+    assert asyncio.run(change_server.build_server().list_tools()) == []
+    monkeypatch.setenv(change.FLAG, "1")
+    tools = asyncio.run(change_server.build_server().list_tools())
+    assert {t.name for t in tools} == set(change.__all__)
