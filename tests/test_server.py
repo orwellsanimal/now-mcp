@@ -7,16 +7,18 @@ import pytest
 pytest.importorskip("mcp")
 
 from now_config import server as config_server, verbs as config_verbs  # noqa: E402
-from now_data import server as data_server, verbs as data_verbs  # noqa: E402
+from now_data import kb as data_kb, server as data_server, verbs as data_verbs  # noqa: E402
 
 
+# now-data serves the KB verbs too (servicenow-coder#282), so they are named here, not read from
+# server.TOOL_MODULES: a module left out of it would then be left out of the expectation as well.
 @pytest.mark.parametrize(
-    "server_mod, verbs_mod",
-    [(config_server, config_verbs), (data_server, data_verbs)],
+    "server_mod, verbs_mods",
+    [(config_server, [config_verbs]), (data_server, [data_verbs, data_kb])],
 )
-def test_every_verb_is_registered(server_mod, verbs_mod):
+def test_every_verb_is_registered(server_mod, verbs_mods):
     tools = asyncio.run(server_mod.build_server().list_tools())
-    expected = {n for n in verbs_mod.__all__ if n.startswith("now_")}
+    expected = {n for m in verbs_mods for n in m.__all__ if n.startswith("now_")}
     assert {t.name for t in tools} == expected
 
 

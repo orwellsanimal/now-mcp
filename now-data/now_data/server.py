@@ -8,15 +8,20 @@ allowed. This module is the only place `mcp` is imported; install it with the
 
 from __future__ import annotations
 
-from now_data import verbs
+from now_data import kb, verbs
+
+# Every module whose `__all__` is served as tools. The change verbs have their own server,
+# off by default (change_server.py).
+TOOL_MODULES = (verbs, kb)
 
 
 def build_server():
     from mcp.server.fastmcp import FastMCP
 
     server = FastMCP("now-data")
-    for name in verbs.__all__:
-        server.tool()(getattr(verbs, name))
+    for module in TOOL_MODULES:
+        for name in module.__all__:
+            server.tool()(getattr(module, name))
     return server
 
 
