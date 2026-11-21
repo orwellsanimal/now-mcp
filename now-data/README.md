@@ -18,6 +18,8 @@ Usable two ways:
 | `now_update(table, sys_id, values, confirmed=False)` | **Dry run by default**: returns `changes` / `no_ops` / `unknown_fields` and writes nothing. Writes only with `confirmed=True`, then **reads back** (see below). Unknown fields are never written, because ServiceNow silently ignores writes to non-existent columns |
 | `now_insert(table, values, confirmed=False)` | **Dry run by default**: returns `values` / `unknown_fields` and inserts nothing. `confirmed=True` inserts one row, reads it back and returns its `sys_id`. A confirmed insert with an unknown field is refused |
 | `now_run_script(script, confirmed=False)` | **Gated** server-side JavaScript. The default echoes the script back. `confirmed=True` needs the instance-side endpoint described below |
+| `now_kb_create_article(knowledge_base, short_description, text, category="", fields=None, confirmed=False)` | **Dry run by default.** Creates a draft knowledge article: finds the KB by title or sys_id and the category by its path, and refuses a name that matches nothing or more than one. Inserts through `now_insert`, so the row is read back. See [Knowledge articles](#knowledge-articles) |
+| `now_kb_publish_article(article, confirmed=False)` | **Dry run by default.** Publishes a draft through its KB's publish flow, as the Publish button does, so an approval flow still asks for approval. Needs the `now_run_script` endpoint. See [Knowledge articles](#knowledge-articles) |
 
 ## Install
 
@@ -139,6 +141,36 @@ A `confirmed=True` run POSTs `{"script": "<function body>"}` to a Scripted REST 
 - return `{success, result, result_type, error?, message?}`.
 
 If the endpoint doesn't exist, the verb returns `action: "endpoint_missing"` and executes nothing.
+
+## Knowledge articles
+
+`now_kb_create_article` creates a draft and `now_kb_publish_article` publishes it (servicenow-coder#282). Both are dry runs unless `confirmed=True`.
+
+**Create.**
+- `knowledge_base` is the KB's title or sys_id. A title matches exactly first, then ignoring case, and it is never put into an encoded query.
+- `category` (optional) is the category's full path in that KB (`"Operating Systems / Windows"`), a label only one of its categories has, or its sys_id.
+- A name that matches nothing raises `ValueError` listing what exists. A name that matches more than one record lists every match.
+- `fields` sets other `kb_knowledge` fields, such as `meta` or `valid_to`. It can't set `workflow_state`, `version`, `published` or system fields: the instance's insert rules make the article a draft, version 0.01.
+- The result has the article's `number`, `workflow_state` and `version`. The KB's `publish_flow` says what publishing will do.
+- It creates a plain `kb_knowledge` article. Template classes (`kb_template_*`, such as Known Error articles) aren't covered yet.
+
+**Publish.**
+- It runs the platform's own publish: `new global.KnowledgeUIAction().publish(gr)`, after `KBKnowledge().canPublish(gr)`. That starts the KB's publish flow (`kb_knowledge_base.kb_publish_flow`):
+  - **Knowledge - Instant Publish** publishes at once.
+  - **Knowledge - Approval Publish** moves the article to Review and asks for approval.
+- It never writes `workflow_state` itself. A field write would skip the flow, and with it the approval and the version bump (0.01 to 1.0).
+- No REST API publishes (the Knowledge Management API is read-only), so the call goes through the [`now_run_script` endpoint](#now_run_script-endpoint). Publishing therefore needs an admin identity until a dedicated endpoint exists.
+- `article` is a number or a sys_id. Numbers aren't unique: versions share one, and imported demo data reuses them. Of several rows, the one marked `latest` is taken. If that still leaves more than one, every match is listed, and you give the sys_id.
+- The outcome is read back from the article, waiting up to 15 s for the flow. `action` is one of:
+  - `published`;
+  - `in_review` (an approval flow is waiting);
+  - `scheduled`;
+  - `not_published`, with a `reason`;
+  - `refused` (not a draft, or the KB has no publish flow; nothing ran);
+  - `endpoint_missing`;
+  - `unconfirmed` (the read-back failed: check before retrying).
+
+Verified on a PDI on 2026-11-21: a draft in a KB that uses Knowledge - Instant Publish was published in 1.4 s. It went from version 0.01 to 1.0, with the same `kb_version` history as an article published with the Publish button.
 
 ## As a library
 
