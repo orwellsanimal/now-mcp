@@ -148,9 +148,9 @@ If the endpoint doesn't exist, the verb returns `action: "endpoint_missing"` and
 
 **Create.**
 - `knowledge_base` is the KB's title or sys_id. A title matches exactly first, then ignoring case, and it is never put into an encoded query.
-- `category` (optional) is the category's full path in that KB (`"Operating Systems / Windows"`), a label only one of its categories has, or its sys_id.
+- `category` (optional) is a category of that KB: its full path (`"Operating Systems / Windows"`), its label, or its sys_id. Paths and labels are matched together. A name that matches more than one category is refused: a top-level "Windows" and "Operating Systems / Windows" both match `"Windows"`.
 - A name that matches nothing raises `ValueError` listing what exists. A name that matches more than one record lists every match.
-- `fields` sets other `kb_knowledge` fields, such as `meta` or `valid_to`. It can't set `workflow_state`, `version`, `published` or system fields: the instance's insert rules make the article a draft, version 0.01.
+- `fields` sets other `kb_knowledge` fields, such as `meta` or `valid_to`. It can't set `number`, `workflow_state`, `version`, `published` or system fields. The instance numbers the article, and its insert rules make it a draft, version 0.01.
 - The result has the article's `number`, `workflow_state` and `version`. The KB's `publish_flow` says what publishing will do.
 - It creates a plain `kb_knowledge` article. Template classes (`kb_template_*`, such as Known Error articles) aren't covered yet.
 
@@ -160,15 +160,20 @@ If the endpoint doesn't exist, the verb returns `action: "endpoint_missing"` and
   - **Knowledge - Approval Publish** moves the article to Review and asks for approval.
 - It never writes `workflow_state` itself. A field write would skip the flow, and with it the approval and the version bump (0.01 to 1.0).
 - No REST API publishes (the Knowledge Management API is read-only), so the call goes through the [`now_run_script` endpoint](#now_run_script-endpoint). Publishing therefore needs an admin identity until a dedicated endpoint exists.
-- `article` is a number or a sys_id. Numbers aren't unique: versions share one, and imported demo data reuses them. Of several rows, the one marked `latest` is taken. If that still leaves more than one, every match is listed, and you give the sys_id.
+- `article` is a number or a sys_id. Numbers aren't unique: an article's versions share one, and imported demo data reuses them in other KBs.
+  - When every row is in one KB, they're taken as one article's versions, and the row marked `latest` is used.
+  - Rows in more than one KB, or several marked latest, are refused with every match listed. Give the sys_id then.
+  - A sys_id read from the instance is checked like one given by the caller before it reaches a query or the script.
+- It doesn't start a second publish while a flow is still running on the article: a `sys_flow_context` for it in any unfinished state. (The platform's own check looks only for `WAITING`.) So calling again after an `unconfirmed` outcome can't double the flow or its approval request.
 - The outcome is read back from the article, waiting up to 15 s for the flow. `action` is one of:
   - `published`;
-  - `in_review` (an approval flow is waiting);
+  - `in_review`: an approval flow is waiting;
   - `scheduled`;
-  - `not_published`, with a `reason`;
-  - `refused` (not a draft, or the KB has no publish flow; nothing ran);
-  - `endpoint_missing`;
-  - `unconfirmed` (the read-back failed: check before retrying).
+  - `unconfirmed`: the publish may have started, but the article was still a draft after the wait, or it couldn't be read back. Check it with `now_get` first;
+  - `not_published`, with a `reason`: nothing was published. Either this account can't publish to the KB, a flow is already running, or the script couldn't read the article;
+  - `refused`: not a draft, or the KB has no publish flow. Nothing ran;
+  - `endpoint_missing`: nothing ran;
+  - `unexpected_state`: the article is in a state no publish leads to.
 
 Verified on a PDI on 2026-11-21: a draft in a KB that uses Knowledge - Instant Publish was published in 1.4 s. It went from version 0.01 to 1.0, with the same `kb_version` history as an article published with the Publish button.
 

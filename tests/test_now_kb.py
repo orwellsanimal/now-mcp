@@ -1,8 +1,14 @@
 """now_data.kb against fake now-data verbs (no network, servicenow-coder#282).
 
-The fake holds the shapes measured on dev442835 on 2026-11-21: a category tree under
-parent_table/parent_id, article numbers shared by several rows, and KBs whose kb_publish_flow is
-"Knowledge - Instant Publish" or "Knowledge - Approval Publish".
+The fake holds the shapes measured on dev442835 on 2026-11-21:
+- a category tree under parent_table/parent_id;
+- article numbers shared by several rows, as versions in one KB and as demo data across KBs;
+- `version` as a reference (a kb_version sys_id whose label is "1.0");
+- KBs whose kb_publish_flow is "Knowledge - Instant Publish" or "Knowledge - Approval Publish";
+- sys_flow_context rows by source_record and state.
+
+Like the instance, it returns only the fields asked for, so a field dropped from a request breaks
+a test (PR #26 review).
 """
 
 import re
@@ -61,14 +67,15 @@ class Fake:
                 _art(DEMO_B, "KB0010104", KB_IT, latest="true"),
                 _art(NOFLOW_DRAFT, "KB0010105", KB_NOFLOW),
             ],
+            "sys_flow_context": [],
         }
         self.queries, self.inserts, self.scripts, self.state_reads = [], [], [], 0
         self.endpoint = "https://dev.example/api/global/now_data/run_script"
-        # What the publish script does: the state it leaves the article in, after how many reads.
+        # What the publish does: the state it leaves the article in, after how many state reads.
         self.publish_to, self.publish_after_reads = "published", 0
-        self.script_answer = None  # overrides the script's result
-        self.script_raises = None
+        self.script_answer = None  # overrides the script's answer (and publishes nothing)
         self.get_raises = None
+        self.flow_query_raises = None
         self.published_id = None
 
     # -- now-data verbs ---------------------------------------------------------------------------
@@ -81,15 +88,18 @@ class Fake:
         f, v = term.split("=", 1)
         return str(row.get(f, "")) == v
 
-    def _shape(self, table, row, display_value):
+    def _shape(self, table, row, fields, display_value):
         def label(f):
             if f in row.get("_labels", {}):
                 return row["_labels"][f]
             if table == "kb_knowledge" and f == "kb_knowledge_base":
                 return next(k["title"] for k in self.rows["kb_knowledge_base"] if k["sys_id"] == row[f])
             return row[f]
+        wanted = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
         out = {}
         for f in (k for k in row if not k.startswith("_")):
+            if wanted is not None and f not in wanted:
+                continue  # as the instance does: only the fields asked for
             if display_value == "all":
                 out[f] = {"value": row[f], "display_value": label(f)}
             elif display_value is True:
@@ -100,9 +110,11 @@ class Fake:
 
     def now_query(self, table, query="", fields="", limit=50, display_value=False):
         self.queries.append((table, query))
+        if table == "sys_flow_context" and self.flow_query_raises:
+            raise self.flow_query_raises
         terms = [t for t in query.split("^") if t]
         rows = [r for r in self.rows.get(table, []) if all(self._match(r, t) for t in terms)]
-        out = [self._shape(table, r, display_value) for r in rows[:limit]]
+        out = [self._shape(table, r, fields, display_value) for r in rows[:limit]]
         return {"count": len(out), "truncated": len(rows) > limit, "records": out}
 
     def now_get(self, table, sys_id, fields="", display_value=False):
@@ -115,7 +127,7 @@ class Fake:
             self.state_reads += 1
             if self.state_reads > self.publish_after_reads:
                 row["workflow_state"] = self.publish_to
-        return self._shape(table, row, display_value)
+        return self._shape(table, row, fields, display_value)
 
     def now_insert(self, table, values, confirmed=False):
         unknown = sorted(f for f in values if f in ("bogus",))
@@ -129,13 +141,21 @@ class Fake:
                 "differences": []}
 
     def now_run_script(self, script, confirmed=False):
+        """The publish script, as the instance would run it."""
         assert confirmed is True
         self.scripts.append(script)
-        if self.script_raises:
-            raise self.script_raises
         sys_id = re.search(r"gr\.get\('([0-9a-f]{32})'\)", script).group(1)
         if self.script_answer is not None:
             return self.script_answer
+        # The script stops on a running flow only if it says so before it publishes.
+        states = re.search(r"addQuery\('state', 'IN', '([A-Z_,]+)'\)", script).group(1).split(",")
+        stop = script.find("if (flows.next()) return {found: true, before: before, in_flight:")
+        guarded = 0 <= stop < script.find("KnowledgeUIAction().publish(gr)")
+        running = [c for c in self.rows["sys_flow_context"]
+                   if c["source_record"] == sys_id and c["state"] in states]
+        if running and guarded:
+            return {"action": "executed", "result": {"found": True, "before": "draft",
+                                                     "in_flight": running[0]["name"]}}
         self.published_id = sys_id
         return {"confirmed": True, "action": "executed", "success": True,
                 "result": {"found": True, "before": "draft", "can_publish": True, "publish_returned": True}}
@@ -155,6 +175,9 @@ def fake(monkeypatch):
     monkeypatch.setattr(kb, "_clock", lambda: now[0])
     monkeypatch.setattr(kb, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
     return f
+
+
+ALL_READS = 1 + int(kb.SETTLE_SECONDS // kb._POLL_SECONDS)  # one read, then one per poll
 
 
 # ── create: lookups ─────────────────────────────────────────────────────────────────────────────
@@ -189,6 +212,12 @@ def test_an_ambiguous_kb_title_is_refused_with_both_sys_ids(fake):
         kb.now_kb_create_article("Twin", "s", "t")
 
 
+def test_a_kb_title_is_not_trusted_unique_when_the_kb_list_was_truncated(fake, monkeypatch):
+    monkeypatch.setattr(kb.verbs, "MAX_LIMIT", 2)
+    with pytest.raises(ValueError, match="more than 1000 active knowledge bases.*give its sys_id"):
+        kb.now_kb_create_article("Field Service Knowledge", "s", "t")
+
+
 def test_a_kb_title_never_reaches_an_encoded_query(fake):
     # A title can hold ^, which would extend the query: titles are compared in Python.
     with pytest.raises(ValueError):
@@ -206,10 +235,26 @@ def test_category_path_ignores_case_and_spacing_around_slashes(fake):
     assert r["category"]["sys_id"] == CAT_WIN
 
 
+def test_a_unique_label_names_a_nested_category(fake):
+    assert kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="Windows")["category"]["sys_id"] == CAT_WIN
+
+
 def test_an_ambiguous_category_label_lists_every_path(fake):
     with pytest.raises(ValueError, match=r"2 categories .* 'How To': Applications / How To .*; "
                                          r"Operating Systems / Windows / How To"):
         kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="How To")
+
+
+def test_a_path_that_is_also_another_categorys_label_is_refused(fake):
+    # A top-level "Windows" (path "Windows") and "Operating Systems / Windows" (label "Windows"):
+    # "Windows" names both, so neither is picked (PR #26 review).
+    top = "6" * 32
+    fake.rows["kb_category"].append(_cat(top, "Windows", KB_FS, "kb_knowledge_base"))
+    with pytest.raises(ValueError, match="2 categories .* match 'Windows'") as e:
+        kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="Windows")
+    assert f"Windows ({top})" in str(e.value) and f"Operating Systems / Windows ({CAT_WIN})" in str(e.value)
+    r = kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="Operating Systems / Windows")
+    assert r["category"]["sys_id"] == CAT_WIN
 
 
 def test_a_category_of_another_kb_is_not_found(fake):
@@ -226,10 +271,37 @@ def test_a_category_row_whose_parent_is_another_table_is_not_in_the_tree(fake):
         kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="Impostor")
 
 
+def _chain(fake, depth):
+    parent, table = KB_IT, "kb_knowledge_base"
+    for i in range(depth):
+        sid = f"c{i:031x}"
+        fake.rows["kb_category"].append(_cat(sid, f"L{i + 1}", parent, table))
+        parent, table = sid, "kb_category"
+    return parent
+
+
+def test_a_tree_exactly_max_depth_deep_resolves_and_one_deeper_is_refused(fake):
+    leaf = _chain(fake, kb._MAX_DEPTH)
+    r = kb.now_kb_create_article("IT", "s", "t", category=f"L{kb._MAX_DEPTH}")
+    assert r["category"]["sys_id"] == leaf
+    fake.rows["kb_category"].append(_cat("d" * 32, "Too deep", leaf))
+    with pytest.raises(ValueError, match="nested more than 20 deep"):
+        kb.now_kb_create_article("IT", "s", "t", category="Too deep")
+
+
+def test_a_category_sys_id_from_the_instance_that_isnt_one_is_dropped(fake):
+    # Instance values go into the next level's parent_idIN query, so only real sys_ids may.
+    fake.rows["kb_category"].append(_cat("x,y'^ORactive=false", "Odd", KB_FS, "kb_knowledge_base"))
+    with pytest.raises(ValueError, match="has no active category 'Odd'"):
+        kb.now_kb_create_article("Field Service Knowledge", "s", "t", category="Odd")
+    assert all("ORactive=false" not in q for _, q in fake.queries)
+
+
 # ── create: fields and writes ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("field, why", [
     ("workflow_state", "the instance sets it"), ("version", "the instance sets it"),
+    ("number", "the instance sets it"),
     ("kb_category", "category argument"), ("text", "text argument"), ("sys_created_by", "a system field"),
 ])
 def test_fields_the_verb_or_the_instance_owns_are_refused_before_anything(fake, field, why):
@@ -261,7 +333,7 @@ def test_confirmed_create_names_the_row_when_its_number_cannot_be_read(fake):
     assert r["number"] is None and "9" * 32 in r["note"] and "Don't create it again" in r["note"]
 
 
-def test_confirmed_create_flags_an_article_that_isnt_a_draft(fake):
+def test_confirmed_create_flags_an_article_that_isnt_a_draft(fake, monkeypatch):
     orig = fake.now_insert
 
     def insert(table, values, confirmed=False):
@@ -269,7 +341,7 @@ def test_confirmed_create_flags_an_article_that_isnt_a_draft(fake):
         fake.rows["kb_knowledge"][-1]["workflow_state"] = "published"
         return out
 
-    kb.verbs.now_insert = insert
+    monkeypatch.setattr(kb.verbs, "now_insert", insert)
     r = kb.now_kb_create_article("IT", "s", "t", confirmed=True)
     assert "not a draft" in r["note"]
 
@@ -297,7 +369,7 @@ def test_publish_takes_a_lowercase_number(fake):
     assert kb.now_kb_publish_article("kb0010100")["article"]["sys_id"] == DRAFT
 
 
-def test_a_shared_number_resolves_to_its_latest_version(fake):
+def test_a_shared_number_in_one_kb_resolves_to_its_latest_version(fake):
     assert kb.now_kb_publish_article("KB0010103")["article"]["sys_id"] == NEW_V
 
 
@@ -306,11 +378,35 @@ def test_a_number_two_current_articles_share_is_refused_listing_both(fake):
         kb.now_kb_publish_article("KB0010104")
 
 
+def test_a_number_shared_across_kbs_is_refused_even_with_one_latest(fake):
+    # The dev442835 KB0010001 shape: a demo row (latest=false) in one KB, an unrelated article
+    # (latest=true) in another. Latest says nothing about which was meant (PR #26 review).
+    fake.rows["kb_knowledge"][6]["latest"] = "false"  # DEMO_B
+    with pytest.raises(ValueError, match="KB0010104 is the number of 2 articles"):
+        kb.now_kb_publish_article("KB0010104")
+
+
+def test_a_number_with_more_rows_than_were_read_is_refused(fake):
+    for i in range(kb._NUMBER_ROWS):
+        fake.rows["kb_knowledge"].append(_art(f"e{i:031x}", "KB0010103", KB_FS, latest="false"))
+    with pytest.raises(ValueError, match="more than 20 articles: give the sys_id"):
+        kb.now_kb_publish_article("KB0010103")
+
+
 @pytest.mark.parametrize("bad", ["", "KB-1", "x' ); gs.info('x", "a" * 31])
 def test_anything_but_a_number_or_sys_id_is_refused_before_a_query(fake, bad):
     with pytest.raises(ValueError):
         kb.now_kb_publish_article(bad)
     assert fake.queries == []
+
+
+def test_a_sys_id_from_the_instance_that_isnt_one_never_reaches_the_script(fake):
+    # The article's sys_id is formatted into the publish script: one read from the instance is
+    # checked like one given by the caller (PR #26 review).
+    fake.rows["kb_knowledge"].append(_art("x'); gs.print('pwned'); //", "KB0010200", KB_FS))
+    with pytest.raises(ValueError, match="is not a sys_id"):
+        kb.now_kb_publish_article("KB0010200", confirmed=True)
+    assert fake.scripts == []
 
 
 def test_publish_dry_run_of_a_published_article_says_why_not(fake):
@@ -332,6 +428,29 @@ def test_a_version_3_kb_with_no_publish_flow_is_not_publishable(fake):
     assert r["action"] == "refused" and fake.scripts == []
 
 
+def test_an_article_whose_kb_cannot_be_read_is_refused(fake):
+    fake.rows["kb_knowledge_base"] = [k for k in fake.rows["kb_knowledge_base"] if k["sys_id"] != KB_FS]
+    fake.rows["kb_knowledge"][0]["_labels"]["kb_knowledge_base"] = "(unreadable)"
+    r = kb.now_kb_publish_article("KB0010100", confirmed=True)
+    assert r["action"] == "refused" and "can't be read" in r["reason"] and fake.scripts == []
+
+
+def test_publish_dry_run_with_a_flow_running_on_the_article_is_not_publishable(fake):
+    fake.rows["sys_flow_context"].append({"source_record": DRAFT, "state": "IN_PROGRESS", "name": INSTANT})
+    r = kb.now_kb_publish_article("KB0010100")
+    assert r["publishable"] is False and "already running" in r["note"]
+
+
+def test_a_finished_flow_on_the_article_does_not_block(fake):
+    fake.rows["sys_flow_context"].append({"source_record": DRAFT, "state": "COMPLETE", "name": INSTANT})
+    assert kb.now_kb_publish_article("KB0010100")["publishable"] is True
+
+
+def test_dry_run_when_flow_contexts_are_unreadable_still_previews(fake):
+    fake.flow_query_raises = PermissionError("403")
+    assert kb.now_kb_publish_article("KB0010100")["publishable"] is True
+
+
 # ── publish: confirmed ─────────────────────────────────────────────────────────────────────────
 
 def test_confirmed_publish_runs_the_platform_publish_once_and_reads_back(fake):
@@ -343,6 +462,12 @@ def test_confirmed_publish_runs_the_platform_publish_once_and_reads_back(fake):
     assert f"gr.get('{DRAFT}')" in script
     assert "new global.KnowledgeUIAction().publish(gr)" in script
     assert "new global.KBKnowledge().canPublish(gr)" in script
+
+
+def test_the_script_refuses_while_any_unfinished_flow_state_is_on_the_article(fake):
+    kb.now_kb_publish_article("KB0010100", confirmed=True)
+    states = re.search(r"addQuery\('state', 'IN', '([A-Z_,]+)'\)", fake.scripts[0]).group(1).split(",")
+    assert set(states) == {"QUEUED", "IN_PROGRESS", "WAITING", "CONTINUE_SYNC", "PAUSED", "PAUSED_IN_DEBUG"}
 
 
 def test_publish_never_writes_workflow_state_itself(fake, monkeypatch):
@@ -360,19 +485,34 @@ def test_publish_waits_for_a_flow_that_finishes_after_the_script(fake):
     assert r["action"] == "published" and fake.state_reads == 4
 
 
-def test_approval_flow_outcome_is_in_review(fake):
-    fake.publish_to = "review"
+@pytest.mark.parametrize("state, action", [("review", "in_review"), ("scheduled_publish", "scheduled")])
+def test_flow_outcomes_other_than_published(fake, state, action):
+    fake.publish_to = state
     r = kb.now_kb_publish_article("KB0010102", confirmed=True)
-    assert r["action"] == "in_review" and "approval" in r["note"]
+    assert r["action"] == action
 
 
-def test_a_draft_after_the_wait_is_not_published_and_says_check_first(fake):
-    fake.publish_to = "draft"  # the flow never moves it
+def test_a_state_no_publish_leads_to_is_unexpected(fake):
+    fake.publish_to = "retired"
+    assert kb.now_kb_publish_article("KB0010100", confirmed=True)["action"] == "unexpected_state"
+
+
+def test_a_draft_after_the_wait_is_unconfirmed_not_not_published(fake):
+    # The flow may still be running: "not_published" would invite a second publish (PR #26 review).
+    fake.publish_to = "draft"
     r = kb.now_kb_publish_article("KB0010100", confirmed=True)
-    assert (r["action"], r["workflow_state"]) == ("not_published", "draft")
-    # Read once, then once per poll until SETTLE_SECONDS had passed.
-    assert fake.state_reads == 1 + int(kb.SETTLE_SECONDS // kb._POLL_SECONDS)
-    assert "Check it with now_get before trying again" in r["reason"]
+    assert (r["action"], r["workflow_state"]) == ("unconfirmed", "draft")
+    assert "Check it with now_get before anything else" in r["note"]
+    assert fake.state_reads == ALL_READS
+
+
+def test_a_retry_while_the_first_flow_runs_starts_nothing(fake):
+    # The first publish's flow is still running (the instance shows its context); the retry's
+    # script sees it and publishes nothing, so no second flow or approval request.
+    fake.rows["sys_flow_context"].append({"source_record": DRAFT, "state": "WAITING", "name": APPROVAL})
+    r = kb.now_kb_publish_article("KB0010100", confirmed=True)
+    assert r["action"] == "not_published" and "already running" in r["reason"]
+    assert fake.published_id is None and fake.state_reads == 0
 
 
 def test_can_publish_false_is_not_published_with_the_platforms_reason_and_no_wait(fake):
@@ -384,24 +524,46 @@ def test_can_publish_false_is_not_published_with_the_platforms_reason_and_no_wai
     assert fake.state_reads == 1
 
 
-def test_a_script_error_is_reported_from_the_read_back(fake):
-    fake.script_answer = {"action": "script_error", "error": "TypeError", "message": "x is undefined"}
+def test_found_false_is_not_published_and_does_not_wait(fake):
+    fake.script_answer = {"action": "executed", "result": {"found": False}}
+    fake.published_id, fake.publish_to = DRAFT, "draft"
     r = kb.now_kb_publish_article("KB0010100", confirmed=True)
-    assert r["action"] == "not_published" and "script_error" in r["reason"] and "x is undefined" in r["reason"]
+    assert r["action"] == "not_published" and "couldn't read the article" in r["reason"]
+    assert fake.state_reads == 1
 
 
-def test_a_call_that_raises_is_judged_by_the_read_back_not_the_exception(fake):
-    # The POST may have reached the instance: if the article moved, say so.
+def test_a_script_error_with_the_article_still_a_draft_is_unconfirmed(fake):
+    fake.script_answer = {"action": "script_error", "error": "TypeError", "message": "x is undefined"}
+    fake.published_id, fake.publish_to = DRAFT, "draft"
+    r = kb.now_kb_publish_article("KB0010100", confirmed=True)
+    assert r["action"] == "unconfirmed" and "script_error" in r["reason"] and "x is undefined" in r["reason"]
+    assert fake.state_reads == ALL_READS  # waited: the flow may have started before the error
+
+
+def test_a_call_that_raises_is_judged_by_the_read_back_after_waiting(fake, monkeypatch):
+    # The POST may have reached the instance, and the flow may finish later: wait, then say.
     def publish_anyway(script, confirmed=False):
         fake.published_id = DRAFT
         raise ConnectionError("reset")
 
-    kb.verbs.now_run_script = publish_anyway
+    monkeypatch.setattr(kb.verbs, "now_run_script", publish_anyway)
+    fake.publish_after_reads = 2
     r = kb.now_kb_publish_article("KB0010100", confirmed=True)
     assert r["action"] == "published" and r["script"]["error"] == "ConnectionError"
+    assert fake.state_reads == 3
 
 
-def test_a_read_back_that_fails_is_unconfirmed(fake):
+def test_a_call_that_raises_and_publishes_nothing_is_unconfirmed(fake, monkeypatch):
+    def lost(script, confirmed=False):
+        fake.published_id, fake.publish_to = DRAFT, "draft"
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(kb.verbs, "now_run_script", lost)
+    r = kb.now_kb_publish_article("KB0010100", confirmed=True)
+    assert r["action"] == "unconfirmed" and "TimeoutError" in r["reason"]
+
+
+def test_a_read_back_that_fails_is_unconfirmed(fake, monkeypatch):
     orig = fake.now_get
 
     def get(table, sys_id, fields="", display_value=False):
@@ -409,7 +571,7 @@ def test_a_read_back_that_fails_is_unconfirmed(fake):
             raise RuntimeError("down")
         return orig(table, sys_id, fields, display_value)
 
-    kb.verbs.now_get = get
+    monkeypatch.setattr(kb.verbs, "now_get", get)
     r = kb.now_kb_publish_article("KB0010100", confirmed=True)
     assert r["action"] == "unconfirmed" and "before trying again" in r["note"]
 
